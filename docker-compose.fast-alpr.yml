@@ -1,0 +1,12 @@
+services:
+  fast-alpr:
+    build:
+      context: ./third_party/fast-alpr-container
+    container_name: fast-alpr
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    environment:
+      PORT: "8090"
+      FAST_ALPR_OCR_DEVICE: "cpu"
+      FAST_ALPR_DETECTOR_CONF: "0.4"

@@ -31,6 +31,8 @@ class Config:
     event_idle_seconds: float
     prebuffer_seconds: float
     postbuffer_seconds: float
+    prebuffer_frames: int
+    postbuffer_frames: int
     upload_top_frames: int
     upload_min_sharpness: float
     event_output_dir: Path
@@ -39,6 +41,8 @@ class Config:
     recognize_vehicle: bool
     debug_windows: bool
     request_timeout_seconds: float
+    fast_alpr_url: str
+    fast_alpr_min_confidence: float
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -69,6 +73,8 @@ class Config:
             event_idle_seconds=float(os.getenv("EVENT_IDLE_SECONDS", "1.5")),
             prebuffer_seconds=float(os.getenv("PREBUFFER_SECONDS", "2.0")),
             postbuffer_seconds=float(os.getenv("POSTBUFFER_SECONDS", "1.5")),
+            prebuffer_frames=max(0, int(os.getenv("PREBUFFER_FRAMES", "0"))),
+            postbuffer_frames=max(0, int(os.getenv("POSTBUFFER_FRAMES", "0"))),
             upload_top_frames=max(1, int(os.getenv("UPLOAD_TOP_FRAMES", "3"))),
             upload_min_sharpness=float(os.getenv("UPLOAD_MIN_SHARPNESS", "80.0")),
             event_output_dir=Path(os.getenv("EVENT_OUTPUT_DIR", "./events")).expanduser(),
@@ -77,6 +83,8 @@ class Config:
             recognize_vehicle=parse_bool(os.getenv("RECOGNIZE_VEHICLE", "true"), default=True),
             debug_windows=parse_bool(os.getenv("DEBUG_WINDOWS", "false"), default=False),
             request_timeout_seconds=float(os.getenv("REQUEST_TIMEOUT_SECONDS", "20")),
+            fast_alpr_url=os.getenv("FAST_ALPR_URL", "").strip(),
+            fast_alpr_min_confidence=float(os.getenv("FAST_ALPR_MIN_CONFIDENCE", "0.75")),
         )
 
 
@@ -96,6 +104,7 @@ class Event:
     candidates: List[CandidateFrame]
     last_motion_at: float
     last_frame_at: float
+    frames_since_motion: int
 
 
 class OpenAlprClient:
@@ -177,8 +186,8 @@ class RtspVehicleWatcher:
                 if had_motion:
                     self._on_motion(timestamp, frame, motion_area)
                 elif self.event:
-                    self._append_event_frame(timestamp, frame)
-                    if timestamp - self.event.last_motion_at >= self.config.event_idle_seconds + self.config.postbuffer_seconds:
+                    self._append_event_frame(timestamp, frame, count_as_postbuffer=True)
+                    if self._event_ready_to_finalize(timestamp):
                         self._finalize_event()
 
                 self.frame_index += 1
@@ -195,9 +204,19 @@ class RtspVehicleWatcher:
 
     def _push_prebuffer(self, timestamp: float, frame) -> None:
         self.prebuffer.append((timestamp, frame.copy()))
-        max_frames = max(1, int(self.fps_guess * self.config.prebuffer_seconds))
+        max_frames = max(1, self._prebuffer_frame_limit())
         while len(self.prebuffer) > max_frames:
             self.prebuffer.popleft()
+
+    def _prebuffer_frame_limit(self) -> int:
+        if self.config.prebuffer_frames > 0:
+            return self.config.prebuffer_frames
+        return int(self.fps_guess * self.config.prebuffer_seconds)
+
+    def _postbuffer_frame_limit(self) -> int:
+        if self.config.postbuffer_frames > 0:
+            return self.config.postbuffer_frames
+        return int(self.fps_guess * self.config.postbuffer_seconds)
 
     def _roi_bounds(self, frame) -> Tuple[int, int, int, int]:
         height, width = frame.shape[:2]
@@ -259,21 +278,32 @@ class RtspVehicleWatcher:
                 candidates=[candidate],
                 last_motion_at=timestamp,
                 last_frame_at=timestamp,
+                frames_since_motion=0,
             )
             logging.info("Motion started; opening event")
-            self._append_event_frame(timestamp, frame)
+            self._append_event_frame(timestamp, frame, count_as_postbuffer=False)
             return
 
         self.event.trigger_count += 1
         self.event.last_motion_at = timestamp
+        self.event.frames_since_motion = 0
         self.event.candidates.append(candidate)
-        self._append_event_frame(timestamp, frame)
+        self._append_event_frame(timestamp, frame, count_as_postbuffer=False)
 
-    def _append_event_frame(self, timestamp: float, frame) -> None:
+    def _append_event_frame(self, timestamp: float, frame, count_as_postbuffer: bool) -> None:
         if not self.event:
             return
         self.event.frames.append((timestamp, frame.copy()))
         self.event.last_frame_at = timestamp
+        if count_as_postbuffer:
+            self.event.frames_since_motion += 1
+
+    def _event_ready_to_finalize(self, timestamp: float) -> bool:
+        if not self.event:
+            return False
+        enough_idle_time = timestamp - self.event.last_motion_at >= self.config.event_idle_seconds
+        enough_post_frames = self.event.frames_since_motion >= self._postbuffer_frame_limit()
+        return enough_idle_time and enough_post_frames
 
     def _finalize_event(self) -> None:
         if not self.event:
@@ -292,16 +322,31 @@ class RtspVehicleWatcher:
         self._write_clip(event.frames, clip_path)
 
         selected = self._select_best_frames(event)
-        results = []
+        openalpr_results = []
+        fast_alpr_results = []
         for index, candidate in enumerate(selected, start=1):
             frame_path = event_dir / f"frame_{index:02d}.jpg"
             json_path = event_dir / f"frame_{index:02d}.json"
             jpeg_bytes = self._encode_jpeg(candidate.frame)
             frame_path.write_bytes(jpeg_bytes)
+
+            local_result = None
+            if self.config.fast_alpr_url:
+                try:
+                    local_result = self._recognize_fast_alpr(jpeg_bytes)
+                    (event_dir / f"frame_{index:02d}.fast_alpr.json").write_text(json.dumps(local_result, indent=2))
+                    fast_alpr_results.append(local_result)
+                except Exception:
+                    logging.exception("Failed to analyze frame %s with fast-alpr", index)
+
+            if self.config.fast_alpr_url and not self._fast_alpr_has_confident_plate(local_result):
+                logging.info("Skipping OpenALPR upload for frame %s because fast-alpr found no confident plate", index)
+                continue
+
             try:
                 result = self.client.recognize(jpeg_bytes)
                 json_path.write_text(json.dumps(result, indent=2))
-                results.append(result)
+                openalpr_results.append(result)
                 logging.info("Uploaded frame %s for ALPR analysis", index)
             except Exception:
                 logging.exception("Failed to upload frame %s", index)
@@ -313,7 +358,8 @@ class RtspVehicleWatcher:
             "trigger_count": event.trigger_count,
             "saved_frames": len(selected),
             "clip_path": str(clip_path),
-            "alpr_results_count": len(results),
+            "fast_alpr_results_count": len(fast_alpr_results),
+            "openalpr_results_count": len(openalpr_results),
         }
         (event_dir / "summary.json").write_text(json.dumps(summary, indent=2))
         logging.info("Event saved to %s", event_dir)
@@ -363,6 +409,25 @@ class RtspVehicleWatcher:
         if not ok:
             raise RuntimeError("Could not encode JPEG")
         return encoded.tobytes()
+
+    def _recognize_fast_alpr(self, jpeg_bytes: bytes) -> dict:
+        response = requests.post(
+            f"{self.config.fast_alpr_url.rstrip('/')}/recognize",
+            files={"image": ("frame.jpg", jpeg_bytes, "image/jpeg")},
+            timeout=self.config.request_timeout_seconds,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _fast_alpr_has_confident_plate(self, result: Optional[dict]) -> bool:
+        if not result:
+            return False
+        for item in result.get("results", []):
+            plate = item.get("plate")
+            confidence = float(item.get("confidence") or 0.0)
+            if plate and confidence >= self.config.fast_alpr_min_confidence:
+                return True
+        return False
 
 
 def main() -> None:

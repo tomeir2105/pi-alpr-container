@@ -1,0 +1,4 @@
+fast-alpr
+fastapi
+uvicorn[standard]
+python-multipart
