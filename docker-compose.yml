@@ -4,6 +4,8 @@ services:
       context: .
     container_name: pi-alpr-watcher
     restart: unless-stopped
+    mem_limit: 1g
+    cpus: "1.50"
     env_file:
       - .env
     environment:
@@ -22,6 +24,8 @@ services:
       context: ./third_party/fast-alpr-container
     container_name: fast-alpr
     restart: unless-stopped
+    mem_limit: 2g
+    cpus: "2.00"
     ports:
       - "8090:8090"
     environment:

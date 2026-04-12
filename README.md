@@ -6,6 +6,7 @@ It also exposes a local dashboard UI:
 
 - Unified dashboard: `http://127.0.0.1:8080/`
 - Live video with zoom/pan controls: `http://127.0.0.1:8080/live`
+- Stream statistics: `http://127.0.0.1:8080/stats`
 - Captured images: `http://127.0.0.1:8080/images`
 - Saved videos: `http://127.0.0.1:8080/videos`
 - Detected plates: `http://127.0.0.1:8080/plates`
@@ -68,6 +69,7 @@ When the watcher is running, open:
 
 - `http://127.0.0.1:8080/`
 - `http://127.0.0.1:8080/live`
+- `http://127.0.0.1:8080/stats`
 - `http://127.0.0.1:8080/images`
 - `http://127.0.0.1:8080/videos`
 - `http://127.0.0.1:8080/plates`
@@ -76,6 +78,7 @@ When the watcher is running, open:
 
 - The dashboard shows the editable motion zones and motion sensitivity controls.
 - The live page shows a clean camera feed with zoom, pan, and reset controls.
+- The stats page tracks capture FPS, dashboard FPS, read failures, reconnects, and large capture gaps.
 - The images page opens image details in the same tab and supports keyboard navigation: left arrow for newer images, right arrow for older images.
 - The videos page opens video details in the same tab with the top menu still visible.
 - The images, videos, and plates pages include clear buttons for removing saved images, saved videos, or detected plate entries.
@@ -84,7 +87,10 @@ When the watcher is running, open:
 ## Tuning
 
 - `ROI` should cover only the driveway or road where cars pass.
+- Hikvision channel `101` is usually the high-resolution main stream; use `102` when the main stream smears or the host cannot decode it at camera FPS.
+- `ALPR_RTSP_URL` can point at the high-resolution `101` stream so ALPR receives sharper images while motion/live/video stay on the stable `102` stream.
 - `PLATE_ROI` can be a tighter sub-zone where plates are expected to appear; this powers the zoom panel and crops frames before ALPR runs.
+- `FRAME_WIDTH=960` keeps processing, streaming, and recordings bounded. Use `0` only if the host has enough CPU/RAM for the camera's native resolution.
 - `MIN_MOTION_AREA` filters out tiny motion like rain, trees, and shadows.
 - `MIN_CONSECUTIVE_HITS` helps avoid one-frame false triggers.
 - `PREBUFFER_SECONDS` keeps video from before the trigger.
@@ -97,15 +103,20 @@ When the watcher is running, open:
 - `UPLOAD_MIN_SHARPNESS` skips blurry frames when possible.
 - `FAST_ALPR_URL` enables local plate recognition before cloud upload.
 - `FAST_ALPR_MIN_CONFIDENCE` is the minimum local OCR confidence required before a frame is sent to OpenALPR.
+- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `TELEGRAM_ALERT_IMAGES` enable Telegram photo alerts for movement events.
 - `PLATE_ROI` crops frames to the likely plate area before local/cloud ALPR and powers the zoomed monitoring panel.
 - `WEB_PORT` controls the local monitoring UI port.
 - `MAX_SAVED_IMAGES` limits how many JPG captures are kept across all events.
+- `STREAM_FPS` controls the dashboard MJPEG refresh rate without slowing the RTSP reader.
+- `CAPTURE_BUFFER_SIZE` and `RTSP_CAPTURE_OPTIONS` favor stable TCP capture over lowest-latency capture to avoid H.264 smear from damaged reference frames.
 - `EVENT_OUTPUT_DIR` should stay `/data/events` in containers so files land on `/mnt/localdisk/pi-alpr/events`.
 
 ## Useful environment variables
 
 ```dotenv
 PROCESS_EVERY_N_FRAMES=2
+FRAME_WIDTH=960
+ALPR_RTSP_URL=rtsp://username:password@camera-host:554/Streaming/Channels/101
 MIN_MOTION_AREA=2500
 MIN_CONSECUTIVE_HITS=3
 EVENT_IDLE_SECONDS=1.5
@@ -114,12 +125,20 @@ PREBUFFER_SECONDS=2.0
 POSTBUFFER_SECONDS=5.0
 PREBUFFER_FRAMES=0
 POSTBUFFER_FRAMES=0
-UPLOAD_TOP_FRAMES=20
+UPLOAD_TOP_FRAMES=30
 UPLOAD_MIN_SHARPNESS=80.0
 FAST_ALPR_URL=http://fast-alpr:8090
 FAST_ALPR_MIN_CONFIDENCE=0.75
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+TELEGRAM_ALERT_IMAGES=3
 WEB_PORT=8080
 MAX_SAVED_IMAGES=50
+FFMPEG_THREADS=1
+STREAM_FPS=5
+CAPTURE_BUFFER_SIZE=4
+RTSP_CAPTURE_OPTIONS=rtsp_transport;tcp|max_delay;2000000|stimeout;10000000
+ALPR_CAPTURE_FPS=2
 EVENT_OUTPUT_DIR=/data/events
 PLATE_ROI=0.30,0.45,0.80,0.75
 ```
@@ -152,6 +171,8 @@ Longer motion-triggered MP4 recordings are stored separately under:
 ```text
 /mnt/localdisk/pi-alpr/events/videos/
 ```
+
+MP4 recordings are written through `ffmpeg` as H.264/yuv420p files and are first stored under `events/videos/recording-tmp/`. They move into the main videos directory only after the recording is closed cleanly.
 
 ## Important note
 
