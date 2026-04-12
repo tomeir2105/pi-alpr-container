@@ -1,6 +1,15 @@
 .git
 .env
+.codex
+TODO
 .venv
 __pycache__
 events
+watcher-config.json
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.avi
+*.mov
 third_party/fast-alpr-container/.venv
