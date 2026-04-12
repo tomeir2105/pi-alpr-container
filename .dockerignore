@@ -1,0 +1,6 @@
+.git
+.env
+.venv
+__pycache__
+events
+third_party/fast-alpr-container/.venv

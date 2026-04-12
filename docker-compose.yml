@@ -1,0 +1,39 @@
+services:
+  watcher:
+    build:
+      context: .
+    container_name: pi-alpr-watcher
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      FAST_ALPR_URL: http://fast-alpr:8090
+      EVENT_OUTPUT_DIR: /data/events
+    ports:
+      - "8080:8080"
+    volumes:
+      - /mnt/localdisk/pi-alpr:/data
+    depends_on:
+      fast-alpr:
+        condition: service_healthy
+
+  fast-alpr:
+    build:
+      context: ./third_party/fast-alpr-container
+    container_name: fast-alpr
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    environment:
+      PORT: "8090"
+      FAST_ALPR_OCR_DEVICE: "cpu"
+      FAST_ALPR_DETECTOR_CONF: "0.4"
+      XDG_CACHE_HOME: /data/fast-alpr-cache
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=5).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 120s
+    volumes:
+      - /mnt/localdisk/pi-alpr:/data
