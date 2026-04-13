@@ -4,23 +4,25 @@ import json
 import logging
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import StringIO
 from pathlib import Path
-from urllib.parse import quote, unquote
+from urllib.parse import parse_qs, quote, unquote
 from typing import Any, Deque, List, Optional, Tuple
 
 import cv2
 import numpy as np
 import requests
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 MIN_ALLOWED_MOTION_AREA = 500
 VIDEO_PREBUFFER_SECONDS = 10.0
@@ -30,7 +32,7 @@ MAX_RECORDING_FPS = 15.0
 MAX_VIDEO_PREBUFFER_FRAMES = 30
 VIDEO_WRITER_QUEUE_SECONDS = 8.0
 DEFAULT_RTSP_CAPTURE_OPTIONS = "rtsp_transport;tcp|max_delay;2000000|stimeout;10000000"
-DEFAULT_ALPR_CAPTURE_FPS = 2.0
+DEFAULT_ALPR_CAPTURE_FPS = 1.0
 
 
 def parse_bool(value: str, default: bool = False) -> bool:
@@ -86,67 +88,85 @@ class Config:
     capture_buffer_size: int
     rtsp_capture_options: str
     alpr_capture_fps: float
+    alpr_capture_warmup_seconds: float
+    live_stream_warmup_seconds: float
     telegram_bot_token: str
     telegram_chat_id: str
     telegram_alert_images: int
+    telegram_alerts_enabled: bool
 
     @property
     def openalpr_enabled(self) -> bool:
         return bool(self.secret_key)
 
     @property
-    def telegram_enabled(self) -> bool:
+    def telegram_configured(self) -> bool:
         return bool(self.telegram_bot_token and self.telegram_chat_id and self.telegram_alert_images > 0)
+
+    @property
+    def telegram_enabled(self) -> bool:
+        return self.telegram_configured
 
     @classmethod
     def from_env(cls) -> "Config":
         load_dotenv()
-        rtsp_url = os.getenv("RTSP_URL", "").strip()
-        secret_key = os.getenv("OPENALPR_SECRET_KEY", "").strip()
+        return cls.from_mapping(os.environ)
+
+    @classmethod
+    def from_mapping(cls, env: Any) -> "Config":
+        def getenv(name: str, default: str = "") -> str:
+            value = env.get(name, default)
+            return default if value is None else str(value)
+
+        rtsp_url = getenv("RTSP_URL").strip()
+        secret_key = getenv("OPENALPR_SECRET_KEY").strip()
         if not rtsp_url:
             raise ValueError("RTSP_URL is required")
 
-        roi = parse_normalized_roi(os.getenv("ROI", "").strip(), "ROI")
-        plate_roi = parse_normalized_roi(os.getenv("PLATE_ROI", "").strip(), "PLATE_ROI")
+        roi = parse_normalized_roi(getenv("ROI").strip(), "ROI")
+        plate_roi = parse_normalized_roi(getenv("PLATE_ROI").strip(), "PLATE_ROI")
 
         return cls(
             rtsp_url=rtsp_url,
-            alpr_rtsp_url=os.getenv("ALPR_RTSP_URL", "").strip(),
+            alpr_rtsp_url=getenv("ALPR_RTSP_URL").strip(),
             secret_key=secret_key,
-            country=os.getenv("OPENALPR_COUNTRY", "us").strip(),
-            frame_width=int(os.getenv("FRAME_WIDTH", str(DEFAULT_FRAME_WIDTH))),
-            process_every_n_frames=max(1, int(os.getenv("PROCESS_EVERY_N_FRAMES", "2"))),
-            min_motion_area=max(MIN_ALLOWED_MOTION_AREA, int(os.getenv("MIN_MOTION_AREA", "6500"))),
-            min_consecutive_hits=max(1, int(os.getenv("MIN_CONSECUTIVE_HITS", "3"))),
-            event_idle_seconds=float(os.getenv("EVENT_IDLE_SECONDS", "1.5")),
-            event_max_seconds=max(1.0, float(os.getenv("EVENT_MAX_SECONDS", "60.0"))),
-            prebuffer_seconds=float(os.getenv("PREBUFFER_SECONDS", "2.0")),
-            postbuffer_seconds=float(os.getenv("POSTBUFFER_SECONDS", "5.0")),
-            prebuffer_frames=max(0, int(os.getenv("PREBUFFER_FRAMES", "0"))),
-            postbuffer_frames=max(0, int(os.getenv("POSTBUFFER_FRAMES", "0"))),
-            upload_top_frames=max(1, int(os.getenv("UPLOAD_TOP_FRAMES", "30"))),
-            upload_min_sharpness=float(os.getenv("UPLOAD_MIN_SHARPNESS", "80.0")),
-            event_output_dir=Path(os.getenv("EVENT_OUTPUT_DIR", "./events")).expanduser(),
-            camera_name=os.getenv("CAMERA_NAME", "camera").strip(),
+            country=getenv("OPENALPR_COUNTRY", "us").strip(),
+            frame_width=int(getenv("FRAME_WIDTH", str(DEFAULT_FRAME_WIDTH))),
+            process_every_n_frames=max(1, int(getenv("PROCESS_EVERY_N_FRAMES", "2"))),
+            min_motion_area=max(MIN_ALLOWED_MOTION_AREA, int(getenv("MIN_MOTION_AREA", "6500"))),
+            min_consecutive_hits=max(1, int(getenv("MIN_CONSECUTIVE_HITS", "3"))),
+            event_idle_seconds=float(getenv("EVENT_IDLE_SECONDS", "1.5")),
+            event_max_seconds=max(1.0, float(getenv("EVENT_MAX_SECONDS", "60.0"))),
+            prebuffer_seconds=float(getenv("PREBUFFER_SECONDS", "2.0")),
+            postbuffer_seconds=float(getenv("POSTBUFFER_SECONDS", "5.0")),
+            prebuffer_frames=max(0, int(getenv("PREBUFFER_FRAMES", "0"))),
+            postbuffer_frames=max(0, int(getenv("POSTBUFFER_FRAMES", "0"))),
+            upload_top_frames=max(1, int(getenv("UPLOAD_TOP_FRAMES", "30"))),
+            upload_min_sharpness=float(getenv("UPLOAD_MIN_SHARPNESS", "80.0")),
+            event_output_dir=Path(getenv("EVENT_OUTPUT_DIR", "./events")).expanduser(),
+            camera_name=getenv("CAMERA_NAME", "camera").strip(),
             roi=roi,
             plate_roi=plate_roi,
-            recognize_vehicle=parse_bool(os.getenv("RECOGNIZE_VEHICLE", "true"), default=True),
-            debug_windows=parse_bool(os.getenv("DEBUG_WINDOWS", "false"), default=False),
-            request_timeout_seconds=float(os.getenv("REQUEST_TIMEOUT_SECONDS", "20")),
-            fast_alpr_url=os.getenv("FAST_ALPR_URL", "").strip(),
-            fast_alpr_min_confidence=float(os.getenv("FAST_ALPR_MIN_CONFIDENCE", "0.75")),
-            web_host=os.getenv("WEB_HOST", "0.0.0.0").strip(),
-            web_port=int(os.getenv("WEB_PORT", "8080")),
-            max_saved_images=max(1, int(os.getenv("MAX_SAVED_IMAGES", "50"))),
-            ffmpeg_threads=max(1, int(os.getenv("FFMPEG_THREADS", "1"))),
-            stream_fps=max(1.0, float(os.getenv("STREAM_FPS", "5"))),
-            capture_buffer_size=max(1, int(os.getenv("CAPTURE_BUFFER_SIZE", "4"))),
-            rtsp_capture_options=os.getenv("RTSP_CAPTURE_OPTIONS", DEFAULT_RTSP_CAPTURE_OPTIONS).strip()
+            recognize_vehicle=parse_bool(getenv("RECOGNIZE_VEHICLE", "true"), default=True),
+            debug_windows=parse_bool(getenv("DEBUG_WINDOWS", "false"), default=False),
+            request_timeout_seconds=float(getenv("REQUEST_TIMEOUT_SECONDS", "20")),
+            fast_alpr_url=getenv("FAST_ALPR_URL").strip(),
+            fast_alpr_min_confidence=float(getenv("FAST_ALPR_MIN_CONFIDENCE", "0.75")),
+            web_host=getenv("WEB_HOST", "0.0.0.0").strip(),
+            web_port=int(getenv("WEB_PORT", "8080")),
+            max_saved_images=max(1, int(getenv("MAX_SAVED_IMAGES", "200"))),
+            ffmpeg_threads=max(1, int(getenv("FFMPEG_THREADS", "1"))),
+            stream_fps=max(1.0, float(getenv("STREAM_FPS", "5"))),
+            capture_buffer_size=max(1, int(getenv("CAPTURE_BUFFER_SIZE", "4"))),
+            rtsp_capture_options=getenv("RTSP_CAPTURE_OPTIONS", DEFAULT_RTSP_CAPTURE_OPTIONS).strip()
             or DEFAULT_RTSP_CAPTURE_OPTIONS,
-            alpr_capture_fps=max(0.1, float(os.getenv("ALPR_CAPTURE_FPS", str(DEFAULT_ALPR_CAPTURE_FPS)))),
-            telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
-            telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
-            telegram_alert_images=max(0, int(os.getenv("TELEGRAM_ALERT_IMAGES", "3"))),
+            alpr_capture_fps=max(0.1, float(getenv("ALPR_CAPTURE_FPS", str(DEFAULT_ALPR_CAPTURE_FPS)))),
+            alpr_capture_warmup_seconds=max(0.0, float(getenv("ALPR_CAPTURE_WARMUP_SECONDS", "1.5"))),
+            live_stream_warmup_seconds=max(0.0, float(getenv("LIVE_STREAM_WARMUP_SECONDS", "1.5"))),
+            telegram_bot_token=getenv("TELEGRAM_BOT_TOKEN").strip(),
+            telegram_chat_id=getenv("TELEGRAM_CHAT_ID").strip(),
+            telegram_alert_images=max(0, int(getenv("TELEGRAM_ALERT_IMAGES", "3"))),
+            telegram_alerts_enabled=parse_bool(getenv("TELEGRAM_ALERTS_ENABLED", "true"), default=True),
         )
 
 
@@ -158,6 +178,7 @@ class CandidateFrame:
     sharpness: float
     jpeg_bytes: Optional[bytes] = None
     source: str = "capture"
+    zone_ids: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -167,6 +188,7 @@ class MotionZone:
     roi: Tuple[float, float, float, float]
     enabled: bool
     use_fast_alpr: bool
+    send_telegram: bool
     color_hex: str
     fill_rgba: str
     overlay_bgr: Tuple[int, int, int]
@@ -200,11 +222,13 @@ class AlprCaptureSession:
     stop_event: threading.Event
     thread: threading.Thread
     frames: Deque[CandidateFrame]
+    confirmed: bool = False
 
 
 @dataclass
 class VideoRecording:
     started_at: float
+    first_frame_at: float
     ends_at: float
     started_from_zone_ids: set[str]
     output_path: Path
@@ -213,6 +237,9 @@ class VideoRecording:
     last_written_at: float
     frame_size: Tuple[int, int]
     fps: float
+    source_url: str = ""
+    confirmed: bool = False
+    pending_events: List[Event] = field(default_factory=list)
 
 
 class FfmpegVideoWriter:
@@ -271,6 +298,50 @@ class FfmpegVideoWriter:
         if self.process.returncode != 0:
             message = stderr.decode("utf-8", errors="replace").strip()
             raise RuntimeError(f"ffmpeg failed to write {self.output_path}: {message}")
+
+
+class DirectRtspVideoRecorder:
+    def __init__(self, source_url: str, output_path: Path, transport: str, duration_seconds: float) -> None:
+        self.source_url = source_url
+        self.output_path = output_path
+        self.process = subprocess.Popen(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-rtsp_transport",
+                transport,
+                "-i",
+                source_url,
+                "-an",
+                "-t",
+                f"{duration_seconds:.3f}",
+                "-c:v",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ],
+            stderr=subprocess.PIPE,
+        )
+
+    def isOpened(self) -> bool:
+        return self.process.poll() is None
+
+    def release(self) -> None:
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+        stderr = self.process.stderr.read() if self.process.stderr else b""
+        if self.process.returncode not in {0, 255, -15}:
+            message = stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"ffmpeg failed to record {self.output_path}: {message}")
 
 
 class QueuedVideoWriter:
@@ -395,6 +466,8 @@ class RtspVehicleWatcher:
         self.video_recording: Optional[VideoRecording] = None
         self.alpr_capture_session: Optional[AlprCaptureSession] = None
         self.alpr_capture_lock = threading.Lock()
+        self.event_log_lock = threading.Lock()
+        self.event_log: Deque[dict[str, Any]] = deque(maxlen=100)
         self.frame_index = 0
         self.fps_guess = 12.0
         self.capture = None
@@ -443,6 +516,7 @@ class RtspVehicleWatcher:
                 roi=primary_roi,
                 enabled=True,
                 use_fast_alpr=True,
+                send_telegram=self.config.telegram_alerts_enabled,
                 color_hex="#facc15",
                 fill_rgba="rgba(250,204,21,0.14)",
                 overlay_bgr=(0, 200, 255),
@@ -453,6 +527,7 @@ class RtspVehicleWatcher:
                 roi=(0.55, 0.18, 0.95, 0.52),
                 enabled=False,
                 use_fast_alpr=False,
+                send_telegram=self.config.telegram_alerts_enabled,
                 color_hex="#c084fc",
                 fill_rgba="rgba(192,132,252,0.16)",
                 overlay_bgr=(250, 120, 170),
@@ -477,6 +552,16 @@ class RtspVehicleWatcher:
                 self._sync_primary_zone_to_config()
                 return
             payload = json.loads(self.runtime_config_path.read_text())
+            legacy_telegram_alerts_enabled = payload.get("telegram_alerts_enabled")
+            if isinstance(legacy_telegram_alerts_enabled, str):
+                legacy_telegram_default = parse_bool(
+                    legacy_telegram_alerts_enabled,
+                    default=self.config.telegram_alerts_enabled,
+                )
+            elif legacy_telegram_alerts_enabled is not None:
+                legacy_telegram_default = bool(legacy_telegram_alerts_enabled)
+            else:
+                legacy_telegram_default = self.config.telegram_alerts_enabled
             zones_payload = payload.get("zones")
             if isinstance(zones_payload, list):
                 for zone_payload in zones_payload:
@@ -493,6 +578,11 @@ class RtspVehicleWatcher:
                         ) or zone.roi
                     zone.enabled = bool(zone_payload.get("enabled", zone.enabled))
                     zone.use_fast_alpr = bool(zone_payload.get("use_fast_alpr", zone.use_fast_alpr))
+                    send_telegram_value = zone_payload.get("send_telegram", legacy_telegram_default)
+                    if isinstance(send_telegram_value, str):
+                        zone.send_telegram = parse_bool(send_telegram_value, default=zone.send_telegram)
+                    else:
+                        zone.send_telegram = bool(send_telegram_value)
             roi_value = payload.get("roi")
             if isinstance(roi_value, str):
                 primary_zone = self._find_motion_zone("yellow")
@@ -503,6 +593,8 @@ class RtspVehicleWatcher:
                 clamped_min_motion_area = max(MIN_ALLOWED_MOTION_AREA, int(min_motion_area))
                 should_resave = clamped_min_motion_area != int(min_motion_area)
                 self.config.min_motion_area = clamped_min_motion_area
+            if legacy_telegram_alerts_enabled is not None:
+                self.config.telegram_alerts_enabled = legacy_telegram_default
             self._sync_primary_zone_to_config()
             if should_resave:
                 self._save_runtime_config()
@@ -525,10 +617,12 @@ class RtspVehicleWatcher:
                             "roi": [float(value) for value in zone.roi],
                             "enabled": zone.enabled,
                             "use_fast_alpr": zone.use_fast_alpr,
+                            "send_telegram": zone.send_telegram,
                         }
                         for zone in self.motion_zones
                     ],
                     "min_motion_area": int(self.config.min_motion_area),
+                    "telegram_alerts_enabled": bool(self.config.telegram_alerts_enabled),
                 },
                 indent=2,
             )
@@ -627,6 +721,7 @@ class RtspVehicleWatcher:
                 triggered_zone_ids: set[str] = set()
                 overlay = self._draw_monitor_overlays(frame.copy())
 
+                raw_motion = False
                 if process_this_frame:
                     motion_area, raw_motion, best_box, overlay, triggered_zone_ids, zone_area_by_id = self._detect_motion(frame)
                     if raw_motion:
@@ -651,6 +746,10 @@ class RtspVehicleWatcher:
                     if self.config.debug_windows:
                         cv2.imshow("watcher", overlay)
                         cv2.waitKey(1)
+                    if raw_motion:
+                        self._start_video_recording(timestamp, triggered_zone_ids, confirmed=False)
+                    elif not self.event and self.motion_streak == 0:
+                        self._discard_unconfirmed_video_recording()
                 else:
                     had_motion = self.motion_streak >= self.config.min_consecutive_hits
                     overlay = self._annotate_motion_overlay(
@@ -667,9 +766,17 @@ class RtspVehicleWatcher:
                 if had_motion:
                     if not triggered_zone_ids:
                         triggered_zone_ids = set(self.last_triggered_zone_ids)
-                    self._start_alpr_capture_session(timestamp)
                     if self.video_recording is None:
-                        self._start_video_recording(timestamp, triggered_zone_ids)
+                        self._start_video_recording(timestamp, triggered_zone_ids, confirmed=True)
+                    else:
+                        self.video_recording.started_from_zone_ids.update(triggered_zone_ids)
+                        if not self.video_recording.confirmed:
+                            self.video_recording.confirmed = True
+                            logging.info("Confirmed video recording for active motion event")
+                            self._add_event_log(
+                                "motion",
+                                f"Confirmed motion for zones={','.join(sorted(triggered_zone_ids)) or 'unknown'}",
+                            )
                     self._on_motion(timestamp, frame, motion_area, triggered_zone_ids)
                     if self._event_exceeded_max_duration(timestamp):
                         self._finalize_event("max duration reached while motion remained active")
@@ -798,13 +905,48 @@ class RtspVehicleWatcher:
             frame = cv2.resize(frame, (width, height))
         return np.ascontiguousarray(frame)
 
-    def _start_video_recording(self, timestamp: float, triggered_zone_ids: set[str]) -> None:
+    def _start_video_recording(self, timestamp: float, triggered_zone_ids: set[str], confirmed: bool = False) -> None:
         if self.video_recording is not None:
             return
         video_dir = self._video_output_dir()
         stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         output_path = video_dir / f"{self.config.camera_name}_{stamp}.mp4"
         temp_output_path = self._video_temp_dir() / output_path.name
+        high_res_url = self._effective_alpr_rtsp_url()
+        if high_res_url and high_res_url != self.config.rtsp_url and shutil.which("ffmpeg"):
+            try:
+                transport = self._rtsp_option_value("rtsp_transport", "tcp") or "tcp"
+                writer = DirectRtspVideoRecorder(high_res_url, temp_output_path, transport, VIDEO_RECORDING_SECONDS)
+                self.video_recording = VideoRecording(
+                    started_at=timestamp,
+                    first_frame_at=timestamp,
+                    ends_at=timestamp + VIDEO_RECORDING_SECONDS,
+                    started_from_zone_ids=set(triggered_zone_ids),
+                    output_path=output_path,
+                    temp_output_path=temp_output_path,
+                    writer=writer,
+                    last_written_at=timestamp,
+                    frame_size=(0, 0),
+                    fps=0.0,
+                    source_url=high_res_url,
+                    confirmed=confirmed,
+                )
+                status = "confirmed motion" if confirmed else "motion warning"
+                logging.info(
+                    "Started 3-minute 101 video recording at %s on %s for zones=%s",
+                    output_path,
+                    status,
+                    ",".join(sorted(triggered_zone_ids)) or "unknown",
+                )
+                self._add_event_log(
+                    "video",
+                    f"Started 101 video {output_path.name} on {status} for zones={','.join(sorted(triggered_zone_ids)) or 'unknown'}",
+                )
+                return
+            except Exception:
+                temp_output_path.unlink(missing_ok=True)
+                logging.exception("Failed to start 101 video recording; falling back to motion stream frames")
+                self._add_event_log("video", "Failed to start 101 video; falling back to motion stream frames")
         prebuffer_frames = [
             (frame_timestamp, frame_copy)
             for frame_timestamp, frame_copy in self.prebuffer
@@ -841,6 +983,7 @@ class RtspVehicleWatcher:
             temp_output_path.unlink(missing_ok=True)
             raise RuntimeError(f"Unable to open video writer for {temp_output_path}")
         last_written_at = 0.0
+        first_frame_at = timestamp
         min_frame_interval = 1.0 / fps
         try:
             for frame_timestamp, buffered_frame in prebuffer_frames:
@@ -848,6 +991,8 @@ class RtspVehicleWatcher:
                     continue
                 prepared_frame = self._prepare_video_frame(buffered_frame, frame_size)
                 writer.write(prepared_frame)
+                if not last_written_at:
+                    first_frame_at = frame_timestamp
                 last_written_at = frame_timestamp
         except Exception:
             writer.release()
@@ -855,6 +1000,7 @@ class RtspVehicleWatcher:
             raise
         self.video_recording = VideoRecording(
             started_at=timestamp,
+            first_frame_at=first_frame_at,
             ends_at=timestamp + VIDEO_RECORDING_SECONDS,
             started_from_zone_ids=set(triggered_zone_ids),
             output_path=output_path,
@@ -863,11 +1009,19 @@ class RtspVehicleWatcher:
             last_written_at=last_written_at,
             frame_size=frame_size,
             fps=fps,
+            source_url=self.config.rtsp_url,
+            confirmed=confirmed,
         )
+        status = "confirmed motion" if confirmed else "motion warning"
         logging.info(
-            "Started 3-minute video recording at %s for zones=%s",
+            "Started 3-minute video recording at %s on %s for zones=%s",
             output_path,
+            status,
             ",".join(sorted(triggered_zone_ids)) or "unknown",
+        )
+        self._add_event_log(
+            "video",
+            f"Started motion-stream video {output_path.name} on {status} for zones={','.join(sorted(triggered_zone_ids)) or 'unknown'}",
         )
 
     def _append_video_recording_frame(self, timestamp: float, frame) -> None:
@@ -876,6 +1030,8 @@ class RtspVehicleWatcher:
             return
         if timestamp > recording.ends_at:
             self._stop_video_recording()
+            return
+        if recording.source_url and recording.source_url != self.config.rtsp_url:
             return
         min_frame_interval = 1.0 / recording.fps
         if timestamp <= recording.last_written_at or timestamp - recording.last_written_at < min_frame_interval:
@@ -902,6 +1058,12 @@ class RtspVehicleWatcher:
                 recording.output_path,
                 exc_info=(type(release_error), release_error, release_error.__traceback__),
             )
+            self._add_event_log("video", f"Failed to close video {recording.output_path.name}")
+            return
+        if not recording.confirmed:
+            recording.temp_output_path.unlink(missing_ok=True)
+            logging.info("Discarded unconfirmed video recording %s", recording.temp_output_path)
+            self._add_event_log("video", f"Discarded unconfirmed video {recording.output_path.name}")
             return
         try:
             recording.temp_output_path.replace(recording.output_path)
@@ -909,14 +1071,34 @@ class RtspVehicleWatcher:
         except Exception:
             recording.temp_output_path.unlink(missing_ok=True)
             logging.exception("Failed to finalize video recording %s", recording.output_path)
+            self._add_event_log("video", f"Failed to finalize video {recording.output_path.name}")
             return
         logging.info("Saved video recording to %s", recording.output_path)
+        self._add_event_log("video", f"Saved video {recording.output_path.name}")
+        if recording.pending_events:
+            thread = threading.Thread(
+                target=self._save_video_events,
+                args=(recording,),
+                daemon=True,
+            )
+            thread.start()
 
-    def _start_alpr_capture_session(self, timestamp: float) -> None:
-        if not self.config.alpr_rtsp_url or self.config.alpr_rtsp_url == self.config.rtsp_url:
+    def _discard_unconfirmed_video_recording(self) -> None:
+        recording = self.video_recording
+        if recording is None or recording.confirmed:
+            return
+        self._stop_video_recording()
+
+    def _start_alpr_capture_session(self, timestamp: float, confirmed: bool = False) -> None:
+        high_res_url = self._effective_alpr_rtsp_url()
+        if not high_res_url or high_res_url == self.config.rtsp_url:
             return
         with self.alpr_capture_lock:
-            if self.alpr_capture_session is not None:
+            session = self.alpr_capture_session
+            if session is not None:
+                if confirmed and not session.confirmed:
+                    session.confirmed = True
+                    logging.info("Confirmed high-resolution ALPR sampler for active motion event")
                 return
             stop_event = threading.Event()
             frames: Deque[CandidateFrame] = deque(maxlen=max(self.config.upload_top_frames * 2, 30))
@@ -931,48 +1113,197 @@ class RtspVehicleWatcher:
                 stop_event=stop_event,
                 thread=thread,
                 frames=frames,
+                confirmed=confirmed,
             )
             thread.start()
-        logging.info("Started high-resolution ALPR sampler from %s", self.config.alpr_rtsp_url)
+        status = "confirmed motion" if confirmed else "motion warning"
+        logging.info("Started high-resolution ALPR sampler from %s on %s", high_res_url, status)
 
     def _run_alpr_capture_session(self, stop_event: threading.Event, frames: Deque[CandidateFrame]) -> None:
-        try:
-            min_interval = 1.0 / self.config.alpr_capture_fps
-            last_sample_at = 0.0
-            while not stop_event.is_set():
-                timestamp = time.time()
-                if timestamp - last_sample_at < min_interval:
-                    stop_event.wait(min(0.1, min_interval))
-                    continue
-                frame = self._capture_single_alpr_frame()
-                crop = self._plate_crop(frame)
-                jpeg_bytes = self._encode_jpeg(crop)
-                frames.append(
-                    CandidateFrame(
-                        frame=None,
-                        timestamp=timestamp,
-                        motion_area=0,
-                        sharpness=self._compute_sharpness(crop),
-                        jpeg_bytes=jpeg_bytes,
-                        source="alpr-rtsp",
-                    )
-                )
+        if shutil.which("ffmpeg") and self._effective_alpr_rtsp_url():
+            try:
+                self._run_ffmpeg_alpr_capture_session(stop_event, frames)
+                return
+            except Exception:
+                logging.exception("Persistent ffmpeg ALPR sampler failed; falling back to single-frame capture")
+        min_interval = 1.0 / self.config.alpr_capture_fps
+        last_sample_at = 0.0
+        failed_captures = 0
+        while not stop_event.is_set():
+            timestamp = time.time()
+            if timestamp - last_sample_at < min_interval:
+                stop_event.wait(min(0.1, min_interval))
+                continue
+            try:
+                frames.append(self._capture_alpr_candidate(timestamp))
+                failed_captures = 0
+            except Exception as exc:
+                failed_captures += 1
+                logging.warning("Skipping bad 101 ALPR sample %s: %s", failed_captures, exc)
+                stop_event.wait(min(0.5, min_interval))
+            finally:
                 last_sample_at = timestamp
-        except Exception:
-            logging.exception("High-resolution ALPR sampler stopped")
+
+    def _run_ffmpeg_alpr_capture_session(self, stop_event: threading.Event, frames: Deque[CandidateFrame]) -> None:
+        high_res_url = self._effective_alpr_rtsp_url()
+        if not high_res_url:
+            return
+        transport = self._rtsp_option_value("rtsp_transport", "tcp") or "tcp"
+        fps = max(0.1, self.config.alpr_capture_fps)
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-fflags",
+            "+discardcorrupt",
+            "-rtsp_transport",
+            transport,
+            "-i",
+            high_res_url,
+            "-an",
+            "-vf",
+            f"fps={fps:.3f}",
+            "-q:v",
+            "2",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "pipe:1",
+        ]
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        if process.stdout is None:
+            process.kill()
+            raise RuntimeError("Unable to open ffmpeg ALPR sampler")
+        buffer = b""
+        bad_frames = 0
+        opened_at = time.time()
+        try:
+            while not stop_event.is_set():
+                chunk = process.stdout.read(65536)
+                if not chunk:
+                    if process.poll() is not None:
+                        break
+                    continue
+                buffer += chunk
+                while not stop_event.is_set():
+                    start = buffer.find(b"\xff\xd8")
+                    if start < 0:
+                        buffer = buffer[-2:]
+                        break
+                    end = buffer.find(b"\xff\xd9", start + 2)
+                    if end < 0:
+                        if start > 0:
+                            buffer = buffer[start:]
+                        break
+                    jpeg_bytes = buffer[start : end + 2]
+                    buffer = buffer[end + 2 :]
+                    frame = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    if time.time() - opened_at < self.config.alpr_capture_warmup_seconds:
+                        continue
+                    if frame is None or self._looks_like_bad_frame(frame):
+                        bad_frames += 1
+                        if bad_frames in {1, 5, 10} or bad_frames % 25 == 0:
+                            logging.warning("Dropped bad 101 ALPR sampler frame count=%s", bad_frames)
+                        continue
+                    bad_frames = 0
+                    frames.append(self._candidate_from_alpr_frame(frame, time.time()))
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+
+    def _capture_alpr_candidate(self, timestamp: Optional[float] = None) -> CandidateFrame:
+        frame = self._capture_single_alpr_frame()
+        return self._candidate_from_alpr_frame(frame, timestamp or time.time())
+
+    def _candidate_from_alpr_frame(self, frame, timestamp: float) -> CandidateFrame:
+        crop = self._plate_crop(frame)
+        return CandidateFrame(
+            frame=frame.copy(),
+            timestamp=timestamp,
+            motion_area=0,
+            sharpness=self._compute_sharpness(crop),
+            jpeg_bytes=self._encode_jpeg(frame),
+            source="alpr-rtsp",
+        )
 
     def _capture_single_alpr_frame(self):
-        capture = cv2.VideoCapture(self.config.alpr_rtsp_url, cv2.CAP_FFMPEG)
+        high_res_url = self._effective_alpr_rtsp_url()
+        if not high_res_url:
+            raise RuntimeError("ALPR 101 stream is not configured")
+        if shutil.which("ffmpeg"):
+            return self._capture_single_alpr_frame_with_ffmpeg(high_res_url)
+        if self.config.rtsp_capture_options:
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self.config.rtsp_capture_options
+        capture = cv2.VideoCapture(high_res_url, cv2.CAP_FFMPEG)
         try:
             if not capture.isOpened():
                 raise RuntimeError("Unable to open ALPR RTSP stream")
             capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            ok, frame = capture.read()
-            if not ok or frame is None:
+            frame = self._read_first_available_frame(capture, attempts=20)
+            if frame is None:
                 raise RuntimeError("Failed to read frame from ALPR RTSP stream")
             return frame
         finally:
             capture.release()
+
+    def _capture_single_alpr_frame_with_ffmpeg(self, high_res_url: str):
+        transport = self._rtsp_option_value("rtsp_transport", "tcp") or "tcp"
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-fflags",
+            "+discardcorrupt",
+            "-rtsp_transport",
+            transport,
+            "-i",
+            high_res_url,
+            "-an",
+            "-frames:v",
+            "20",
+            "-q:v",
+            "2",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "pipe:1",
+        ]
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=max(10.0, self.config.request_timeout_seconds),
+        )
+        best_frame = None
+        best_sharpness = -1.0
+        for jpeg_bytes in self._iter_jpeg_frames(result.stdout):
+            frame = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame is not None and not self._looks_like_bad_frame(frame):
+                sharpness = self._compute_sharpness(self._plate_crop(frame))
+                if sharpness > best_sharpness:
+                    best_frame = frame
+                    best_sharpness = sharpness
+        if best_frame is not None:
+            return best_frame
+        error = result.stderr.decode("utf-8", errors="replace").strip()
+        if result.returncode != 0 and error:
+            raise RuntimeError(f"ffmpeg ALPR 101 capture failed: {error}")
+        raise RuntimeError("ffmpeg ALPR 101 capture produced only corrupted frames")
+
+    def _read_first_available_frame(self, capture, attempts: int = 5):
+        for _ in range(max(1, attempts)):
+            ok, frame = capture.read()
+            if ok and frame is not None and not self._looks_like_bad_frame(frame):
+                return frame
+        return None
 
     def _stop_alpr_capture_session(self) -> List[CandidateFrame]:
         with self.alpr_capture_lock:
@@ -986,6 +1317,76 @@ class RtspVehicleWatcher:
         logging.info("Stopped high-resolution ALPR sampler with %s frames", len(frames))
         return frames
 
+    def _discard_unconfirmed_alpr_capture_session(self) -> None:
+        with self.alpr_capture_lock:
+            session = self.alpr_capture_session
+            if session is None or session.confirmed:
+                return
+            self.alpr_capture_session = None
+        session.stop_event.set()
+        session.thread.join(timeout=1.0)
+        logging.info("Discarded high-resolution ALPR sampler after motion warning cleared")
+
+    def _uses_high_res_image_stream(self) -> bool:
+        high_res_url = self._effective_alpr_rtsp_url()
+        return bool(high_res_url and high_res_url != self.config.rtsp_url)
+
+    def _effective_alpr_rtsp_url(self) -> str:
+        if self.config.alpr_rtsp_url:
+            return self.config.alpr_rtsp_url
+        return self._derive_hikvision_101_url(self.config.rtsp_url)
+
+    def _derive_hikvision_101_url(self, rtsp_url: str) -> str:
+        return re.sub(r"(?i)(/Streaming/Channels/)102\\b", r"\g<1>101", rtsp_url)
+
+    def _rtsp_option_value(self, name: str, default: str = "") -> str:
+        parts = [part.strip() for part in self.config.rtsp_capture_options.split("|") if part.strip()]
+        for part in parts:
+            key, separator, value = part.partition(";")
+            if separator and key.strip().lower() == name.lower():
+                return value.strip()
+        return default
+
+    def _iter_jpeg_frames(self, payload: bytes):
+        buffer = payload
+        while True:
+            start = buffer.find(b"\xff\xd8")
+            if start < 0:
+                return
+            end = buffer.find(b"\xff\xd9", start + 2)
+            if end < 0:
+                return
+            yield buffer[start : end + 2]
+            buffer = buffer[end + 2 :]
+
+    def _looks_like_bad_frame(self, frame) -> bool:
+        if frame is None or frame.size == 0:
+            return True
+        height, width = frame.shape[:2]
+        if width < 8 or height < 8:
+            return True
+        sample_width = min(320, width)
+        sample_height = max(8, int(round(sample_width * height / max(1, width))))
+        sample = cv2.resize(frame, (sample_width, sample_height))
+        means = sample.reshape(-1, 3).mean(axis=0)
+        blue, green, red = (float(value) for value in means)
+        stddev = float(sample.std())
+        channel_spread = max(blue, green, red) - min(blue, green, red)
+        green_artifact = green > max(blue, red) + 40.0 and blue < 30.0 and red < 30.0
+        flat_gray_artifact = stddev < 10.0 and channel_spread < 8.0
+        gray = cv2.cvtColor(sample, cv2.COLOR_BGR2GRAY).astype("int16")
+        vertical_grad = float(np.mean(np.abs(np.diff(gray, axis=0)))) if gray.shape[0] > 1 else 0.0
+        horizontal_grad = float(np.mean(np.abs(np.diff(gray, axis=1)))) if gray.shape[1] > 1 else 0.0
+        column_std = float(gray.std(axis=0).mean())
+        stripe_artifact = vertical_grad < 0.08 and horizontal_grad > 0.4 and column_std < 0.5 and stddev > 5.0
+        return green_artifact or flat_gray_artifact or stripe_artifact
+
+    def _looks_like_bad_live_jpeg(self, jpeg_bytes: bytes) -> bool:
+        if len(jpeg_bytes) < 2048:
+            return True
+        frame = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+        return self._looks_like_bad_frame(frame)
+
     def _write_video_metadata(self, recording: VideoRecording) -> None:
         metadata_path = recording.output_path.with_suffix(".json")
         metadata_path.write_text(
@@ -993,9 +1394,12 @@ class RtspVehicleWatcher:
                 {
                     "camera_name": self.config.camera_name,
                     "video_path": str(recording.output_path),
+                    "source": "101" if recording.source_url and recording.source_url != self.config.rtsp_url else "motion-stream",
                     "started_at_epoch": recording.started_at,
+                    "first_frame_at_epoch": recording.first_frame_at,
                     "ends_at_epoch": recording.ends_at,
                     "zone_ids": sorted(recording.started_from_zone_ids),
+                    "event_count": len(recording.pending_events),
                     "prebuffer_seconds": VIDEO_PREBUFFER_SECONDS,
                     "recording_seconds": VIDEO_RECORDING_SECONDS,
                 },
@@ -1034,6 +1438,11 @@ class RtspVehicleWatcher:
 
     def _zone_bounds(self, frame, zone: MotionZone) -> Tuple[int, int, int, int]:
         return self._normalized_roi_bounds(frame, zone.roi)
+
+    def _zone_crop(self, frame, zone: MotionZone):
+        x1, y1, x2, y2 = self._zone_bounds(frame, zone)
+        crop = frame[y1:y2, x1:x2]
+        return crop if crop.size else frame
 
     def _plate_roi_bounds(self, frame) -> Tuple[int, int, int, int]:
         effective_plate_roi = self.config.plate_roi or self.config.roi
@@ -1147,7 +1556,13 @@ class RtspVehicleWatcher:
 
     def _on_motion(self, timestamp: float, frame, motion_area: int, triggered_zone_ids: set[str]) -> None:
         sharpness = self._compute_sharpness(frame)
-        candidate = CandidateFrame(frame=frame.copy(), timestamp=timestamp, motion_area=motion_area, sharpness=sharpness)
+        candidate = CandidateFrame(
+            frame=frame.copy(),
+            timestamp=timestamp,
+            motion_area=motion_area,
+            sharpness=sharpness,
+            zone_ids=set(triggered_zone_ids),
+        )
 
         if self.event is None:
             self.event = Event(
@@ -1161,6 +1576,10 @@ class RtspVehicleWatcher:
                 zones_triggered=set(triggered_zone_ids),
             )
             logging.info("Motion started; opening event")
+            self._add_event_log(
+                "motion",
+                f"Opened motion event zones={','.join(sorted(triggered_zone_ids)) or 'unknown'}",
+            )
             self._append_event_frame(timestamp, frame, count_as_postbuffer=False)
             return
 
@@ -1204,8 +1623,12 @@ class RtspVehicleWatcher:
         frame_path = event_dir / f"{base_name}.jpg"
         json_path = event_dir / f"{base_name}.json"
         if jpeg_bytes is None:
-            jpeg_bytes = self._encode_jpeg(self._plate_crop(frame))
+            jpeg_bytes = self._encode_jpeg(frame)
         frame_path.write_bytes(jpeg_bytes)
+        source = "alpr-rtsp" if frame is not None and self._uses_high_res_image_stream() else "capture"
+        (event_dir / f"{base_name}.meta.json").write_text(
+            json.dumps({"source": source, "detected_at_epoch": detected_at_epoch}, indent=2)
+        )
         relative_frame_path = frame_path.relative_to(self.config.event_output_dir).as_posix()
 
         local_result = None
@@ -1279,12 +1702,82 @@ class RtspVehicleWatcher:
             "openalpr_error": openalpr_error,
         }
 
+    def _save_triggered_zone_images(
+        self,
+        event: Event,
+        event_dir: Path,
+        selected: List[CandidateFrame],
+    ) -> Tuple[List[Path], List[dict[str, Any]]]:
+        image_paths: List[Path] = []
+        summary: List[dict[str, Any]] = []
+        for zone in self.motion_zones:
+            if zone.zone_id == "yellow" or zone.zone_id not in event.zones_triggered:
+                continue
+            candidates = [
+                candidate
+                for candidate in selected
+                if candidate.frame is not None and candidate.source == "video"
+            ]
+            if not candidates:
+                logging.warning("No video-extracted frame available for %s zone image", zone.zone_id)
+                self._add_event_log("image", f"No video-extracted frame available for {zone.zone_id} zone image")
+                continue
+            candidates = sorted(candidates, key=lambda item: item.timestamp)
+            for index, candidate in enumerate(candidates, start=1):
+                crop = self._zone_crop(candidate.frame, zone)
+                image_path = event_dir / f"zone_{zone.zone_id}_{index:02d}.jpg"
+                image_path.write_bytes(self._encode_jpeg(crop))
+                relative_path = image_path.relative_to(self.config.event_output_dir).as_posix()
+                image_paths.append(image_path)
+                self._add_event_log("image", f"Saved {zone.zone_id} zone image {image_path.name} from local video")
+                summary.append(
+                    {
+                        "zone_id": zone.zone_id,
+                        "label": zone.label,
+                        "image_relative_path": relative_path,
+                        "source_frame_timestamp": candidate.timestamp,
+                        "source": candidate.source,
+                    }
+                )
+        return image_paths, summary
+
+    def _event_sends_telegram(self, event: Event) -> bool:
+        for zone_id in event.zones_triggered:
+            zone = self._find_motion_zone(zone_id)
+            if zone and zone.send_telegram:
+                return True
+        return False
+
+    def _telegram_zone_image_paths(self, zone_image_paths: List[Path], zone_image_summary: List[dict[str, Any]]) -> List[Path]:
+        image_path_by_relative = {
+            path.relative_to(self.config.event_output_dir).as_posix(): path
+            for path in zone_image_paths
+        }
+        telegram_paths: List[Path] = []
+        for item in zone_image_summary:
+            zone = self._find_motion_zone(str(item.get("zone_id") or ""))
+            relative_path = str(item.get("image_relative_path") or "")
+            image_path = image_path_by_relative.get(relative_path)
+            if zone and zone.send_telegram and image_path:
+                telegram_paths.append(image_path)
+        return telegram_paths
+
     def _finalize_event(self, reason: str) -> None:
         if not self.event:
             return
         event = self.event
         self.event = None
         logging.info("Closing event: %s", reason)
+        self._add_event_log("motion", f"Closed motion event: {reason}")
+        recording = self.video_recording
+        if recording is not None and recording.confirmed:
+            recording.pending_events.append(event)
+            logging.info(
+                "Queued event for frame extraction after video %s is finalized",
+                recording.output_path,
+            )
+            self._add_event_log("image", f"Queued image extraction after video {recording.output_path.name} closes")
+            return
         thread = threading.Thread(
             target=self._save_finalized_event,
             args=(event, reason),
@@ -1298,17 +1791,53 @@ class RtspVehicleWatcher:
         except Exception:
             logging.exception("Failed to save finalized event: %s", reason)
 
-    def _save_finalized_event_unchecked(self, event: Event, reason: str) -> None:
+    def _save_video_events(self, recording: VideoRecording) -> None:
+        for event in list(recording.pending_events):
+            try:
+                self._add_event_log("image", f"Extracting event images from local video {recording.output_path.name}")
+                self._save_finalized_event_unchecked(
+                    event,
+                    "video finalized",
+                    source_video_path=recording.output_path,
+                    source_video_first_frame_at=recording.first_frame_at,
+                )
+            except Exception:
+                logging.exception("Failed to extract event images from %s", recording.output_path)
+                self._add_event_log("image", f"Failed extracting images from {recording.output_path.name}")
+
+    def _save_finalized_event_unchecked(
+        self,
+        event: Event,
+        reason: str,
+        source_video_path: Optional[Path] = None,
+        source_video_first_frame_at: Optional[float] = None,
+    ) -> None:
         if event.trigger_count < self.config.min_consecutive_hits:
             logging.info("Discarded event with only %s motion hits", event.trigger_count)
+            self._add_event_log("motion", f"Discarded event with only {event.trigger_count} motion hits")
             self._stop_alpr_capture_session()
+            return
+
+        if source_video_path is None or source_video_first_frame_at is None:
+            logging.error("Skipping motion-event images because no finalized local video is available")
+            self._add_event_log("image", "Skipped motion-event images: no finalized local video available")
             return
 
         stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         event_dir = self.config.event_output_dir / f"{self.config.camera_name}_{stamp}"
         event_dir.mkdir(parents=True, exist_ok=True)
-        high_res_candidates = self._stop_alpr_capture_session()
-        selected = self._select_best_frames(event, preferred_candidates=high_res_candidates)
+        image_limit = self.config.upload_top_frames
+        selected = self._extract_video_event_candidates(
+            source_video_path,
+            source_video_first_frame_at,
+            event,
+            image_limit,
+        )
+        if not selected:
+            logging.error("No images extracted from %s. Skipping motion-event image creation.", source_video_path)
+            self._add_event_log("image", f"Skipped event images: no frames extracted from {source_video_path.name}")
+            self._prune_saved_images()
+            return
         openalpr_results = []
         fast_alpr_results = []
         plate_detections: List[PlateDetection] = []
@@ -1334,11 +1863,15 @@ class RtspVehicleWatcher:
                     index,
                     pipeline["openalpr_skipped_reason"],
                 )
+                self._add_event_log("lpr", f"Frame {index}: OpenALPR skipped because {pipeline['openalpr_skipped_reason']}")
             elif pipeline["openalpr_error"]:
                 logging.warning("OpenALPR upload failed for frame %s: %s", index, pipeline["openalpr_error"])
+                self._add_event_log("lpr", f"Frame {index}: OpenALPR failed: {pipeline['openalpr_error']}")
             elif pipeline["openalpr_results"]:
                 logging.info("Uploaded frame %s for ALPR analysis", index)
+                self._add_event_log("lpr", f"Frame {index}: uploaded to OpenALPR")
 
+        zone_image_paths, zone_image_summary = self._save_triggered_zone_images(event, event_dir, selected)
         summary = {
             "camera_name": self.config.camera_name,
             "started_at_epoch": event.started_at,
@@ -1346,23 +1879,35 @@ class RtspVehicleWatcher:
             "trigger_count": event.trigger_count,
             "saved_frames": len(selected),
             "high_res_alpr_frames": sum(1 for candidate in selected if candidate.source == "alpr-rtsp"),
-            "clip_path": None,
+            "clip_path": source_video_path.relative_to(self.config.event_output_dir).as_posix()
+            if source_video_path
+            else None,
+            "image_source": "video" if source_video_path else "event-capture",
             "triggered_zones": self._event_zone_summary(event),
             "event_policy": "fast-alpr" if alpr_enabled else "images-only",
+            "zone_images": zone_image_summary,
             "fast_alpr_results_count": len(fast_alpr_results),
             "openalpr_results_count": len(openalpr_results),
             "plates": [detection.__dict__ for detection in plate_detections],
         }
         (event_dir / "summary.json").write_text(json.dumps(summary, indent=2))
-        self._send_telegram_alert(event_dir.name, summary, saved_frame_paths)
+        self._add_event_log(
+            "image",
+            f"Saved {len(selected)} images from local video into {event_dir.name}",
+        )
+        if self._event_sends_telegram(event):
+            telegram_zone_images = self._telegram_zone_image_paths(zone_image_paths, zone_image_summary)
+            telegram_image_paths = telegram_zone_images or saved_frame_paths
+            self._send_telegram_alert(event_dir.name, summary, telegram_image_paths)
         self._prune_saved_images()
         logging.info("Event saved to %s", event_dir)
 
     def _select_best_frames(
         self, event: Event, preferred_candidates: Optional[List[CandidateFrame]] = None
     ) -> List[CandidateFrame]:
+        image_limit = self.config.upload_top_frames
         if preferred_candidates:
-            return self._select_timeline_candidates(preferred_candidates, self.config.upload_top_frames)
+            return self._select_timeline_candidates(preferred_candidates, image_limit)
         candidates = [
             candidate for candidate in event.candidates if candidate.sharpness >= self.config.upload_min_sharpness
         ]
@@ -1381,7 +1926,7 @@ class RtspVehicleWatcher:
 
         selected: List[CandidateFrame] = []
         if event.frames:
-            selected.extend(self._select_timeline_frames(event.frames, self.config.upload_top_frames))
+            selected.extend(self._select_timeline_frames(event.frames, image_limit))
         selected_timestamps = {candidate.timestamp for candidate in selected}
         ranked = sorted(
             candidates,
@@ -1393,9 +1938,9 @@ class RtspVehicleWatcher:
                 continue
             selected.append(candidate)
             selected_timestamps.add(candidate.timestamp)
-            if len(selected) >= self.config.upload_top_frames:
+            if len(selected) >= image_limit:
                 break
-        if len(selected) < self.config.upload_top_frames:
+        if len(selected) < image_limit:
             for frame_timestamp, frame in event.frames:
                 if frame_timestamp in selected_timestamps:
                     continue
@@ -1408,7 +1953,7 @@ class RtspVehicleWatcher:
                     )
                 )
                 selected_timestamps.add(frame_timestamp)
-                if len(selected) >= self.config.upload_top_frames:
+                if len(selected) >= image_limit:
                     break
         return sorted(selected, key=lambda item: item.timestamp)
 
@@ -1445,6 +1990,66 @@ class RtspVehicleWatcher:
             )
             for frame_timestamp, frame in selected_frames
         ]
+
+    def _video_extraction_timestamps(self, start_at: float, end_at: float, limit: int) -> List[float]:
+        if limit <= 0:
+            return []
+        end_at = max(start_at, end_at)
+        if limit == 1 or end_at <= start_at:
+            return [start_at]
+        return [
+            start_at + ((end_at - start_at) * index / max(1, limit - 1))
+            for index in range(limit)
+        ]
+
+    def _extract_video_event_candidates(
+        self,
+        video_path: Path,
+        first_frame_at: float,
+        event: Event,
+        limit: int,
+    ) -> List[CandidateFrame]:
+        if limit <= 0:
+            return []
+        target_timestamps = self._video_extraction_timestamps(
+            first_frame_at,
+            max(first_frame_at, event.last_frame_at),
+            limit,
+        )
+        self._add_event_log(
+            "image",
+            f"Sampling {len(target_timestamps)} image timestamps from start of local video {video_path.name}",
+        )
+        capture = cv2.VideoCapture(str(video_path))
+        if not capture.isOpened():
+            logging.warning("Unable to open saved video for frame extraction: %s", video_path)
+            self._add_event_log("image", f"Could not open local video {video_path.name} for image extraction")
+            return []
+        candidates: List[CandidateFrame] = []
+        try:
+            for frame_timestamp in target_timestamps:
+                position_ms = max(0.0, frame_timestamp - first_frame_at) * 1000.0
+                capture.set(cv2.CAP_PROP_POS_MSEC, position_ms)
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    logging.warning("Unable to extract video frame at %.3fs from %s", position_ms / 1000.0, video_path)
+                    self._add_event_log("image", f"Could not extract frame at {position_ms / 1000.0:.3f}s from {video_path.name}")
+                    continue
+                candidates.append(
+                    CandidateFrame(
+                        frame=frame.copy(),
+                        timestamp=frame_timestamp,
+                        motion_area=0,
+                        sharpness=self._compute_sharpness(self._plate_crop(frame)),
+                        jpeg_bytes=self._encode_jpeg(frame),
+                        source="video",
+                        zone_ids=set(event.zones_triggered),
+                    )
+                )
+        finally:
+            capture.release()
+        self._add_event_log("image", f"Extracted {len(candidates)} frames from local video {video_path.name}")
+        return candidates
 
     def _telegram_caption(self, event_name: str, summary: dict[str, Any]) -> str:
         plates = summary.get("plates") or []
@@ -1574,6 +2179,7 @@ class RtspVehicleWatcher:
                     "id": zone.zone_id,
                     "label": zone.label,
                     "use_fast_alpr": zone.use_fast_alpr,
+                    "send_telegram": zone.send_telegram,
                 }
             )
         return summary
@@ -1583,7 +2189,7 @@ class RtspVehicleWatcher:
         return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
     def _encode_jpeg(self, frame) -> bytes:
-        ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         if not ok:
             raise RuntimeError("Could not encode JPEG")
         return encoded.tobytes()
@@ -1701,14 +2307,26 @@ class RtspVehicleWatcher:
                 if path == "/api/stats":
                     self._send_json(watcher._stats_snapshot())
                     return
+                if path == "/api/time":
+                    self._send_json(watcher._system_time_snapshot())
+                    return
                 if path == "/api/motion-status":
                     self._send_json({"status": watcher.latest_motion_status})
+                    return
+                if path == "/api/event-log":
+                    self._send_json({"events": watcher._event_log_snapshot()})
+                    return
+                if path == "/api/telegram/settings":
+                    self._send_json(watcher._telegram_settings_for_ui())
                     return
                 if path == "/stream.mjpg":
                     self._send_mjpeg_stream()
                     return
                 if path == "/stream-clean.mjpg":
                     self._send_mjpeg_stream(clean=True)
+                    return
+                if path == "/live.mjpg":
+                    self._send_direct_mjpeg_stream(watcher._effective_alpr_rtsp_url() or watcher.config.rtsp_url)
                     return
                 if path == "/plate-zone.mjpg":
                     self._send_mjpeg_stream(plate_zoom=True)
@@ -1753,6 +2371,21 @@ class RtspVehicleWatcher:
                 if path == "/api/telegram/test":
                     watcher._handle_telegram_test(self)
                     return
+                if path == "/api/telegram/settings":
+                    watcher._handle_telegram_settings_update(self)
+                    return
+                if path == "/api/env":
+                    watcher._handle_env_update(self)
+                    return
+                if path == "/api/time/sync":
+                    watcher._handle_system_time_sync(self)
+                    return
+                if path == "/api/images/alpr":
+                    watcher._handle_saved_image_fast_alpr(self)
+                    return
+                if path == "/api/videos/snapshot-alpr":
+                    watcher._handle_video_snapshot_fast_alpr(self)
+                    return
                 if path == "/test":
                     watcher._handle_test_upload(self)
                     return
@@ -1777,6 +2410,140 @@ class RtspVehicleWatcher:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _write_mjpeg_frame(self, frame: bytes) -> None:
+                self.wfile.write(b"--frame\r\n")
+                self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode("ascii"))
+                self.wfile.write(frame)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+
+            def _send_direct_mjpeg_stream(self, source_url: str) -> None:
+                if shutil.which("ffmpeg"):
+                    self._send_ffmpeg_mjpeg_stream(source_url)
+                    return
+                if watcher.config.rtsp_capture_options:
+                    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = watcher.config.rtsp_capture_options
+                capture = cv2.VideoCapture(source_url, cv2.CAP_FFMPEG)
+                if not capture.isOpened():
+                    capture.release()
+                    self.send_error(HTTPStatus.BAD_GATEWAY, "Unable to open live stream")
+                    return
+                capture.set(cv2.CAP_PROP_BUFFERSIZE, watcher.config.capture_buffer_size)
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.end_headers()
+                min_interval = 1.0 / max(1.0, watcher.config.stream_fps)
+                failed_reads = 0
+                try:
+                    while True:
+                        frame = watcher._read_first_available_frame(capture, attempts=3)
+                        if frame is None:
+                            failed_reads += 1
+                            if failed_reads >= 10:
+                                break
+                            time.sleep(min_interval)
+                            continue
+                        failed_reads = 0
+                        frame = watcher._resize_frame(frame)
+                        self._write_mjpeg_frame(watcher._encode_jpeg(frame))
+                        time.sleep(min_interval)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                finally:
+                    capture.release()
+
+            def _send_ffmpeg_mjpeg_stream(self, source_url: str) -> None:
+                fps = max(1.0, watcher.config.stream_fps)
+                max_width = max(320, min(1920, int(watcher.config.frame_width or 960)))
+                transport = watcher._rtsp_option_value("rtsp_transport", "tcp") or "tcp"
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.end_headers()
+                last_good_jpeg: Optional[bytes] = None
+                while True:
+                    opened_at = time.time()
+                    command = [
+                        "ffmpeg",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-fflags",
+                        "+discardcorrupt",
+                        "-rtsp_transport",
+                        transport,
+                        "-i",
+                        source_url,
+                        "-an",
+                        "-vf",
+                        f"scale={max_width}:-2:force_original_aspect_ratio=decrease",
+                        "-r",
+                        f"{fps:.3f}",
+                        "-q:v",
+                        "4",
+                        "-f",
+                        "image2pipe",
+                        "-vcodec",
+                        "mjpeg",
+                        "pipe:1",
+                    ]
+                    process = subprocess.Popen(
+                        command,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    if process.stdout is None:
+                        process.kill()
+                        return
+                    buffer = b""
+                    bad_frame_count = 0
+                    try:
+                        while True:
+                            chunk = process.stdout.read(65536)
+                            if not chunk:
+                                break
+                            buffer += chunk
+                            while True:
+                                start = buffer.find(b"\xff\xd8")
+                                if start < 0:
+                                    buffer = buffer[-2:]
+                                    break
+                                end = buffer.find(b"\xff\xd9", start + 2)
+                                if end < 0:
+                                    if start > 0:
+                                        buffer = buffer[start:]
+                                    break
+                                jpeg = buffer[start : end + 2]
+                                buffer = buffer[end + 2 :]
+                                if time.time() - opened_at < watcher.config.live_stream_warmup_seconds:
+                                    continue
+                                if watcher._looks_like_bad_live_jpeg(jpeg):
+                                    bad_frame_count += 1
+                                    if last_good_jpeg:
+                                        self._write_mjpeg_frame(last_good_jpeg)
+                                    if bad_frame_count >= 8:
+                                        raise RuntimeError("too many bad live frames")
+                                    continue
+                                bad_frame_count = 0
+                                last_good_jpeg = jpeg
+                                self._write_mjpeg_frame(jpeg)
+                    except RuntimeError:
+                        time.sleep(0.25)
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+                    finally:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=2)
+                    time.sleep(0.25)
+
             def _send_mjpeg_stream(self, plate_zoom: bool = False, clean: bool = False) -> None:
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Cache-Control", "no-store")
@@ -1799,12 +2566,7 @@ class RtspVehicleWatcher:
                                 frame = watcher.latest_frame_jpeg
                             last_frame_version = watcher.latest_frame_version
                         if frame:
-                            self.wfile.write(b"--frame\r\n")
-                            self.wfile.write(b"Content-Type: image/jpeg\r\n")
-                            self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode("ascii"))
-                            self.wfile.write(frame)
-                            self.wfile.write(b"\r\n")
-                            self.wfile.flush()
+                            self._write_mjpeg_frame(frame)
                 except (BrokenPipeError, ConnectionResetError):
                     return
 
@@ -1848,16 +2610,34 @@ class RtspVehicleWatcher:
                 "roi": [float(value) for value in zone.roi],
                 "enabled": zone.enabled,
                 "use_fast_alpr": zone.use_fast_alpr,
+                "send_telegram": zone.send_telegram,
                 "color": zone.color_hex,
                 "fill": zone.fill_rgba,
             }
             for zone in self.motion_zones
         ]
 
+    def _telegram_settings_for_ui(self) -> dict[str, Any]:
+        return {
+            "enabled": bool(self.config.telegram_alerts_enabled),
+            "configured": bool(self.config.telegram_configured),
+            "alert_images": int(self.config.telegram_alert_images),
+        }
+
+    def _env_file_path(self) -> Path:
+        return Path(os.getenv("ALPR_ENV_FILE", ".env")).expanduser()
+
+    def _read_env_text(self) -> str:
+        env_path = self._env_file_path()
+        if env_path.exists():
+            return env_path.read_text()
+        example_path = Path(".env.example")
+        if example_path.exists():
+            return example_path.read_text()
+        return ""
+
     def _render_roi_editor_markup(self) -> str:
         return f"""<div class="panel">
-  <h2>Live video</h2>
-  <p style="color:#cbd5e1; margin-top:0;">Edit the yellow and purple motion zones, then choose whether each zone runs fast-alpr or only saves event images.</p>
   <div id="roi-editor" style="position:relative; max-width:100%;">
     <img id="roi-stream" style="width:100%; max-width:100%; border-radius:14px; border:1px solid #334155; display:block;" src="/stream-clean.mjpg" alt="Live stream">
     <div id="roi-overlay" style="position:absolute; inset:0; pointer-events:none;">
@@ -1876,6 +2656,7 @@ class RtspVehicleWatcher:
         <label style="color:#e2e8f0;"><input id="zone-enabled-yellow" type="checkbox" checked> Enabled</label>
       </div>
       <label style="display:block; margin-top:10px; color:#cbd5e1;"><input id="zone-fast-alpr-yellow" type="checkbox" checked> Send to fast-alpr</label>
+      <label style="display:block; margin-top:10px; color:#cbd5e1;"><input id="zone-telegram-yellow" type="checkbox" checked> Send to Telegram</label>
     </div>
     <div style="background:#0f172a; border:1px solid #334155; border-radius:8px; padding:12px;">
       <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
@@ -1883,6 +2664,7 @@ class RtspVehicleWatcher:
         <label style="color:#e2e8f0;"><input id="zone-enabled-purple" type="checkbox"> Enabled</label>
       </div>
       <label style="display:block; margin-top:10px; color:#cbd5e1;"><input id="zone-fast-alpr-purple" type="checkbox"> Send to fast-alpr</label>
+      <label style="display:block; margin-top:10px; color:#cbd5e1;"><input id="zone-telegram-purple" type="checkbox"> Send to Telegram</label>
     </div>
   </div>
   <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:14px;">
@@ -1935,7 +2717,11 @@ class RtspVehicleWatcher:
     yellow: document.getElementById('zone-fast-alpr-yellow'),
     purple: document.getElementById('zone-fast-alpr-purple'),
   }};
-  if (!editor || !overlay || !img || !saveBtn || !resetBtn || !status || !sensitivity || !sensitivityValue || !sensitivitySave || handles.length !== 4 || !zoneBoxes.yellow || !zoneBoxes.purple || !zoneButtons.yellow || !zoneButtons.purple || !zoneEnabled.yellow || !zoneEnabled.purple || !zoneFastAlpr.yellow || !zoneFastAlpr.purple) return;
+  const zoneTelegram = {{
+    yellow: document.getElementById('zone-telegram-yellow'),
+    purple: document.getElementById('zone-telegram-purple'),
+  }};
+  if (!editor || !overlay || !img || !saveBtn || !resetBtn || !status || !sensitivity || !sensitivityValue || !sensitivitySave || handles.length !== 4 || !zoneBoxes.yellow || !zoneBoxes.purple || !zoneButtons.yellow || !zoneButtons.purple || !zoneEnabled.yellow || !zoneEnabled.purple || !zoneFastAlpr.yellow || !zoneFastAlpr.purple || !zoneTelegram.yellow || !zoneTelegram.purple) return;
 
   let zones = initialZones.map((zone) => ({{ ...zone, roi: zone.roi.slice() }}));
   let activeZoneId = null;
@@ -1978,6 +2764,7 @@ class RtspVehicleWatcher:
     zones.forEach((zone) => {{
       zoneEnabled[zone.id].checked = Boolean(zone.enabled);
       zoneFastAlpr[zone.id].checked = Boolean(zone.use_fast_alpr);
+      zoneTelegram[zone.id].checked = Boolean(zone.send_telegram);
       zoneButtons[zone.id].style.outline = zone.id === activeZoneId ? `2px solid ${{zone.color}}` : 'none';
       zoneButtons[zone.id].textContent = zone.id === activeZoneId ? `Editing ${{zone.label}}` : `Edit ${{zone.label}}`;
     }});
@@ -2010,7 +2797,7 @@ class RtspVehicleWatcher:
         handle.style.pointerEvents = 'none';
       }});
       syncZoneControls();
-      const zoneSummaries = zones.map((zone) => `${{zone.label}}: ${{zone.enabled ? 'on' : 'off'}}, ${{zone.use_fast_alpr ? 'fast-alpr' : 'images only'}}`);
+      const zoneSummaries = zones.map((zone) => `${{zone.label}}: ${{zone.enabled ? 'on' : 'off'}}, ${{zone.use_fast_alpr ? 'fast-alpr' : 'images only'}}, ${{zone.send_telegram ? 'telegram' : 'no telegram'}}`);
       setStatus(`Motion zones saved | ${{zoneSummaries.join(' | ')}}`);
       return;
     }}
@@ -2036,7 +2823,7 @@ class RtspVehicleWatcher:
       handle.style.padding = '0';
     }});
     syncZoneControls();
-    const zoneSummaries = zones.map((zone) => `${{zone.label}}: ${{zone.enabled ? 'on' : 'off'}}, ${{zone.use_fast_alpr ? 'fast-alpr' : 'images only'}}`);
+    const zoneSummaries = zones.map((zone) => `${{zone.label}}: ${{zone.enabled ? 'on' : 'off'}}, ${{zone.use_fast_alpr ? 'fast-alpr' : 'images only'}}, ${{zone.send_telegram ? 'telegram' : 'no telegram'}}`);
     setStatus(`Editing ${{activeZone.label}} | ROI: ${{activeZone.roi.map((v) => v.toFixed(3)).join(', ')}} | ${{zoneSummaries.join(' | ')}}`);
   }}
 
@@ -2106,6 +2893,15 @@ class RtspVehicleWatcher:
     }});
   }});
 
+  Object.entries(zoneTelegram).forEach(([zoneId, checkbox]) => {{
+    checkbox.addEventListener('change', () => {{
+      const zone = findZone(zoneId);
+      if (!zone) return;
+      zone.send_telegram = checkbox.checked;
+      draw();
+    }});
+  }});
+
   sensitivity.addEventListener('input', () => {{
     currentMotionArea = Number(sensitivity.value);
     renderSensitivity();
@@ -2171,6 +2967,14 @@ a { color: #7dd3fc; }
 .nav-links a { color: #cde8de; text-decoration: none; border: 1px solid #2f514b; border-radius: 8px; padding: 8px 11px; background: #10211f; line-height: 1; }
 .nav-links a:hover { border-color: #5eead4; color: #f8fafc; background: #17302d; }
 .nav-links a.active { border-color: #facc15; color: #111827; background: #facc15; font-weight: 700; }
+.system-clock { color: #d9f99d; border: 1px solid #2f514b; border-radius: 8px; background: #07110f; padding: 8px 11px; white-space: nowrap; font-variant-numeric: tabular-nums; line-height: 1; }
+.menu-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+.menu-actions form { margin: 0; }
+.menu-actions button { color: #fee2e2; text-decoration: none; border: 1px solid #7f1d1d; border-radius: 8px; padding: 8px 11px; background: #450a0a; line-height: 1; cursor: pointer; font: inherit; }
+.menu-actions button:hover { border-color: #fca5a5; color: #fff; background: #7f1d1d; }
+.menu-actions button.view-button { color: #cde8de; border-color: #2f514b; background: #10211f; }
+.menu-actions button.view-button:hover { border-color: #5eead4; color: #f8fafc; background: #17302d; }
+.menu-actions button.view-button.active { border-color: #facc15; color: #111827; background: #facc15; font-weight: 700; }
 .panel, .card { border: 1px solid #263d39; box-shadow: 0 10px 28px rgba(0, 0, 0, 0.2); }
 h1 { margin-top: 0; }
 @media (max-width: 760px) {
@@ -2178,6 +2982,9 @@ h1 { margin-top: 0; }
   .topbar { align-items: flex-start; flex-direction: column; }
   .nav-links { justify-content: flex-start; }
   .nav-links a { padding: 9px 10px; }
+  .system-clock { padding: 9px 10px; }
+  .menu-actions { justify-content: flex-start; }
+  .menu-actions button { padding: 9px 10px; }
 }
 """
 
@@ -2185,7 +2992,7 @@ h1 { margin-top: 0; }
         items = [
             ("dashboard", "/", "Dashboard"),
             ("live", "/live", "Live"),
-            ("stats", "/stats", "Stats"),
+            ("stats", "/stats", "Config"),
             ("images", "/images", "Images"),
             ("videos", "/videos", "Videos"),
             ("plates", "/plates", "Plates"),
@@ -2195,10 +3002,50 @@ h1 { margin-top: 0; }
             f'<a class="{"active" if item_id == active else ""}" href="{href}">{label}</a>'
             for item_id, href, label in items
         )
+        action_by_page = {
+            "live": '<button class="view-button active" id="live-horizontal" type="button" aria-pressed="true">Horizontal</button><button class="view-button" id="live-vertical" type="button" aria-pressed="false">Vertical</button>',
+            "images": '<form method="post" action="/api/images/clear" onsubmit="return confirm(\'Remove all saved images?\');"><button type="submit">Remove Images</button></form>',
+            "videos": '<form method="post" action="/api/videos/clear" onsubmit="return confirm(\'Remove all saved videos?\');"><button type="submit">Remove Videos</button></form>',
+            "plates": '<form method="post" action="/api/plates/clear" onsubmit="return confirm(\'Remove all detected plates? Images and videos will stay saved.\');"><button type="submit">Remove Plates</button></form>',
+        }
+        action = action_by_page.get(active, "")
+        actions = f'<div class="menu-actions" aria-label="Page actions">{action}</div>' if action else ""
         return f"""<header class="topbar">
   <a class="brand" href="/">ALPR Watcher</a>
   <nav class="nav-links" aria-label="Main navigation">{links}</nav>
-</header>"""
+  <span class="system-clock" id="system-clock" title="System clock">--:--:--</span>
+  {actions}
+</header>
+<script>
+(() => {{
+  const clock = document.getElementById('system-clock');
+  if (!clock) return;
+  let serverEpochMs = Date.now();
+  let syncedAtMs = performance.now();
+
+  function renderClock() {{
+    const now = new Date(serverEpochMs + (performance.now() - syncedAtMs));
+    clock.textContent = now.toLocaleString();
+  }}
+
+  async function syncClockDisplay() {{
+    try {{
+      const response = await fetch('/api/time', {{ cache: 'no-store' }});
+      if (!response.ok) throw new Error('time unavailable');
+      const payload = await response.json();
+      serverEpochMs = Number(payload.epoch_ms) || Date.now();
+      syncedAtMs = performance.now();
+      renderClock();
+    }} catch (error) {{
+      clock.textContent = new Date().toLocaleString();
+    }}
+  }}
+
+  syncClockDisplay();
+  setInterval(renderClock, 1000);
+  setInterval(syncClockDisplay, 30000);
+}})();
+</script>"""
 
     def _render_live_view_script(self) -> str:
         return """<script>
@@ -2269,8 +3116,9 @@ h1 { margin-top: 0; }
 </script>"""
 
     def _render_home_page(self) -> str:
-        recent = self._render_recent_plate_cards(limit=8)
+        recent = self._render_recent_plate_cards(limit=8, include_images=False)
         gallery = self._render_image_cards(limit=8)
+        event_log = self._render_event_log_items()
         return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>ALPR Watcher</title>
 <style>
@@ -2291,23 +3139,28 @@ a {{ color: #93c5fd; }}
 .card {{ background: #0f172a; border-radius: 12px; padding: 14px; }}
 .plate-code {{ font-size: 1.4rem; font-weight: 700; letter-spacing: 0.08em; }}
 .meta {{ color: #cbd5e1; font-size: 0.95rem; }}
+.event-log {{ display: grid; gap: 8px; max-height: 420px; overflow: auto; }}
+.event-log-item {{ display: grid; grid-template-columns: minmax(150px, auto) auto minmax(0, 1fr); gap: 8px; align-items: baseline; padding: 9px 10px; background: #0f172a; border-radius: 8px; border: 1px solid #263d39; }}
+.event-log-time {{ color: #d9f99d; font-variant-numeric: tabular-nums; font-size: 0.85rem; }}
+.event-log-kind {{ color: #111827; background: #facc15; border-radius: 8px; padding: 3px 7px; font-size: 0.78rem; font-weight: 700; text-transform: uppercase; }}
+.event-log-message {{ color: #e2e8f0; overflow-wrap: anywhere; }}
+.event-log-empty {{ color: #cbd5e1; }}
 @media (max-width: 960px) {{
   .layout {{ grid-template-columns: 1fr; }}
+  .event-log-item {{ grid-template-columns: 1fr; }}
 }}
 {self._render_shared_styles()}
 </style></head>
 <body>
 <div class="page-shell">
 {self._render_nav("dashboard")}
-<div class="hero">
-<div><h1>ALPR Dashboard</h1><p>Live camera, detected plate numbers, and captured evidence in one place.</p></div>
-<div><p>Image retention limit: {self.config.max_saved_images}</p></div>
-</div>
 <div class="layout">
   {self._render_roi_editor_markup()}
   <div class="panel">
     <h2 class="section-title">Recent plate numbers</h2>
     <div class="plates">{recent}</div>
+    <h2 class="section-title" style="margin-top:20px;">Event log</h2>
+    <div id="event-log" class="event-log">{event_log}</div>
   </div>
 </div>
 <div class="panel" style="margin-top:20px;">
@@ -2316,159 +3169,296 @@ a {{ color: #93c5fd; }}
 </div>
 </div>
 {self._render_roi_editor_script()}
+<script>
+(() => {{
+  const log = document.getElementById('event-log');
+  if (!log) return;
+
+  function escapeHtml(value) {{
+    return String(value).replace(/[&<>"']/g, (char) => ({{
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;',
+    }}[char]));
+  }}
+
+  function render(events) {{
+    if (!events.length) {{
+      log.innerHTML = '<div class="event-log-empty">No events logged yet.</div>';
+      return;
+    }}
+    log.innerHTML = events.map((entry) => `
+      <div class="event-log-item">
+        <span class="event-log-time">${{escapeHtml(entry.time_text || '')}}</span>
+        <span class="event-log-kind">${{escapeHtml(entry.category || '')}}</span>
+        <span class="event-log-message">${{escapeHtml(entry.message || '')}}</span>
+      </div>
+    `).join('');
+  }}
+
+  async function refreshEventLog() {{
+    try {{
+      const response = await fetch('/api/event-log', {{ cache: 'no-store' }});
+      if (!response.ok) return;
+      const payload = await response.json();
+      render(Array.isArray(payload.events) ? payload.events : []);
+    }} catch (error) {{
+      // Keep the last rendered log visible.
+    }}
+  }}
+
+  setInterval(refreshEventLog, 2000);
+  refreshEventLog();
+}})();
+</script>
 </body></html>"""
 
     def _render_live_page(self) -> str:
-        recent = self._render_recent_plate_cards(limit=8)
         return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Live Video</title>
 <style>
-body {{ font-family: Arial, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 24px; }}
-a {{ color: #93c5fd; }}
-.layout {{ display: grid; grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr); gap: 24px; align-items: start; }}
-.panel {{ background: #111827; border-radius: 14px; padding: 16px; }}
-.live-viewer {{ background: #050c0b; border: 1px solid #263d39; border-radius: 8px; overflow: hidden; }}
-.live-viewport {{ width: 100%; aspect-ratio: 16 / 9; background: #000; overflow: hidden; }}
-.live-viewport img {{ width: 100%; height: 100%; object-fit: contain; display: block; transform-origin: center; will-change: transform; }}
-.live-controls {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 12px; background: #10211f; }}
-.live-controls button {{ background: #facc15; color: #111827; border: 0; border-radius: 8px; padding: 9px 12px; cursor: pointer; font-weight: 700; }}
-.live-controls .secondary {{ background: #263d39; color: #edf7f2; }}
-.zoom-readout {{ color: #cbd5e1; min-width: 92px; }}
-.plate {{ border-bottom: 1px solid #334155; padding: 12px 0; }}
-.plate:last-child {{ border-bottom: 0; }}
-.plate-code {{ font-size: 1.25rem; font-weight: 700; letter-spacing: 0.08em; }}
-.meta {{ color: #cbd5e1; font-size: 0.95rem; margin-top: 4px; }}
 {self._render_shared_styles()}
+html, body {{ margin: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }}
+body {{ padding: 0; }}
+.page-shell {{ width: 100%; height: 100vh; margin: 0; padding: 0; }}
+.topbar {{ position: fixed; top: 12px; left: 12px; right: 12px; z-index: 5; margin: 0; }}
+.live-frame {{ position: fixed; inset: 0; background: #000; overflow: hidden; }}
+.live-frame img {{ position: absolute; left: 50%; top: 50%; width: 100vw; height: 100vh; object-fit: contain; display: block; background: #000; transform: translate(-50%, -50%); transform-origin: center; }}
+.live-frame.vertical img {{ width: 100vh; height: 100vw; transform: translate(-50%, -50%) rotate(90deg); }}
+@media (max-width: 760px) {{
+  .topbar {{ top: 8px; left: 8px; right: 8px; }}
+}}
 </style></head>
 <body>
 <div class="page-shell">
 {self._render_nav("live")}
-<h1>Live video</h1>
-<div class="layout">
-<div class="live-viewer">
-  <div class="live-viewport">
-    <img id="live-clean-stream" src="/stream-clean.mjpg" alt="Live camera">
-  </div>
-  <div class="live-controls" aria-label="Live view controls">
-    <button id="live-zoom-in" type="button">Zoom In</button>
-    <button id="live-zoom-out" type="button">Zoom Out</button>
-    <button id="live-pan-left" type="button" class="secondary">Left</button>
-    <button id="live-pan-right" type="button" class="secondary">Right</button>
-    <button id="live-pan-up" type="button" class="secondary">Up</button>
-    <button id="live-pan-down" type="button" class="secondary">Down</button>
-    <button id="live-reset" type="button" class="secondary">Reset</button>
-    <span id="live-zoom-readout" class="zoom-readout">Zoom 100%</span>
-  </div>
+<main class="live-frame">
+  <img id="live-clean-stream" src="/live.mjpg" alt="Live camera">
+</main>
 </div>
-<div class="panel"><h2>Recent plate numbers</h2>{recent}</div>
-</div>
-</div>
-{self._render_live_view_script()}
+<script>
+(() => {{
+  const frame = document.querySelector('.live-frame');
+  const horizontal = document.getElementById('live-horizontal');
+  const vertical = document.getElementById('live-vertical');
+  if (!frame || !horizontal || !vertical) return;
+
+  function setOrientation(orientation) {{
+    const isVertical = orientation === 'vertical';
+    frame.classList.toggle('vertical', isVertical);
+    horizontal.classList.toggle('active', !isVertical);
+    vertical.classList.toggle('active', isVertical);
+    horizontal.setAttribute('aria-pressed', String(!isVertical));
+    vertical.setAttribute('aria-pressed', String(isVertical));
+    localStorage.setItem('live-view-orientation', isVertical ? 'vertical' : 'horizontal');
+  }}
+
+  horizontal.addEventListener('click', () => setOrientation('horizontal'));
+  vertical.addEventListener('click', () => setOrientation('vertical'));
+  setOrientation(localStorage.getItem('live-view-orientation') === 'vertical' ? 'vertical' : 'horizontal');
+}})();
+</script>
 </body></html>"""
 
     def _render_stats_page(self) -> str:
+        env_path = self._env_file_path()
+        env_text = self._read_env_text()
+        escaped_env_text = html.escape(env_text)
+        escaped_env_path = html.escape(str(env_path))
+        stats_json = html.escape(json.dumps(self._stats_snapshot(), indent=2))
         return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Stream Stats</title>
+<html><head><meta charset="utf-8"><title>Configuration</title>
 <style>
 body {{ font-family: Arial, sans-serif; background: #07110f; color: #edf7f2; margin: 0; padding: 24px; }}
 a {{ color: #7dd3fc; }}
-.summary {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; margin: 18px 0; }}
-.metric {{ background: #10211f; border: 1px solid #2f514b; border-radius: 8px; padding: 14px; min-height: 96px; }}
-.metric .label {{ color: #a7c4bc; font-size: 0.92rem; margin-bottom: 8px; }}
-.metric .value {{ color: #f8fafc; font-size: 1.75rem; font-weight: 800; line-height: 1.1; }}
-.metric .hint {{ color: #cde8de; font-size: 0.9rem; margin-top: 8px; }}
 .panel {{ background: #0d1a18; border: 1px solid #263d39; border-radius: 8px; padding: 16px; }}
-.status-ok {{ color: #86efac; }}
-.status-warn {{ color: #facc15; }}
-.status-bad {{ color: #fca5a5; }}
-pre {{ white-space: pre-wrap; word-break: break-word; background: #050c0b; border: 1px solid #263d39; border-radius: 8px; padding: 12px; color: #d9f99d; }}
+.config-layout {{ display: grid; gap: 18px; align-items: start; }}
+.config-side {{ display: grid; gap: 18px; }}
+.config-tools {{ display: grid; grid-template-columns: minmax(0, 0.65fr) minmax(0, 1.35fr); gap: 18px; align-items: start; }}
+.stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }}
+.stat {{ background: #07110f; border: 1px solid #263d39; border-radius: 8px; padding: 10px; }}
+.stat-label {{ color: #a7c8bd; font-size: 0.82rem; }}
+.stat-value {{ color: #f8fafc; font-size: 1.05rem; font-weight: 700; margin-top: 4px; overflow-wrap: anywhere; }}
+.config-actions {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 12px; }}
+.config-actions button {{ background: #facc15; color: #111827; border: 0; border-radius: 8px; padding: 10px 14px; cursor: pointer; font-weight: 700; }}
+.config-actions button.secondary {{ background: #38bdf8; }}
+.config-status {{ color: #cde8de; }}
+.config-status.error {{ color: #fca5a5; }}
+.time-tools {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 12px; }}
+.time-tools button {{ background: #facc15; color: #111827; border: 0; border-radius: 8px; padding: 6px 9px; cursor: pointer; font-weight: 700; font-size: 0.86rem; }}
+.time-status {{ color: #cde8de; }}
+.time-status.error {{ color: #fca5a5; }}
+.env-editor {{ width: 100%; min-height: 68vh; resize: vertical; background: #050c0b; color: #d9f99d; border: 1px solid #2f514b; border-radius: 8px; padding: 12px; font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; tab-size: 2; box-sizing: border-box; }}
+.meta {{ color: #cde8de; }}
+pre {{ white-space: pre-wrap; word-break: break-word; background: #050c0b; padding: 12px; border-radius: 8px; overflow-x: auto; }}
+@media (max-width: 960px) {{ .config-tools {{ grid-template-columns: 1fr; }} }}
 {self._render_shared_styles()}
 </style></head>
 <body>
 <div class="page-shell">
 {self._render_nav("stats")}
-<h1>Stream Stats</h1>
-<p class="meta">Use this while watching the camera clock. Large capture gaps are the strongest sign that frames are arriving late or the loop is blocked.</p>
-<div class="summary">
-  <div class="metric"><div class="label">RTSP Capture FPS</div><div id="capture-fps" class="value">...</div><div class="hint">Frames received by the watcher</div></div>
-  <div class="metric"><div class="label">Processing FPS</div><div id="processing-fps" class="value">...</div><div class="hint">Frames completed by the motion loop</div></div>
-  <div class="metric"><div class="label">Dashboard FPS</div><div id="stream-fps" class="value">...</div><div class="hint">MJPEG frames sent to the UI</div></div>
-  <div class="metric"><div class="label">Recent Max Gap</div><div id="recent-gap" class="value">...</div><div id="gap-status" class="hint">Waiting for data</div></div>
-  <div class="metric"><div class="label">All-Time Max Gap</div><div id="max-gap" class="value">...</div><div class="hint">Largest measured capture pause</div></div>
-  <div class="metric"><div class="label">Estimated Missed Frames</div><div id="missed-frames" class="value">...</div><div class="hint">Estimated from capture gaps</div></div>
-  <div class="metric"><div class="label">Read Failures</div><div id="read-failures" class="value">...</div><div class="hint">RTSP read errors</div></div>
-  <div class="metric"><div class="label">Reconnects</div><div id="reconnects" class="value">...</div><div class="hint">Capture loop restarts</div></div>
+<h1>System Configuration</h1>
+<div class="config-layout">
+<div class="panel">
+  <h2>Environment</h2>
+  <textarea id="env-content" class="env-editor" spellcheck="false">{escaped_env_text}</textarea>
+  <div class="config-actions">
+    <button id="env-save-apply" type="button">Save and Apply</button>
+    <button id="env-save" class="secondary" type="button">Save Only</button>
+    <span id="env-status" class="config-status">Ready.</span>
+  </div>
+</div>
+<div class="config-tools">
+<div class="panel">
+  <h2>System Clock</h2>
+  <p class="meta">Server time: <strong id="settings-system-clock">Loading...</strong></p>
+  <p class="meta">Computer time: <strong id="settings-browser-clock">Loading...</strong></p>
+  <div class="time-tools">
+    <button id="time-sync" type="button">Sync with This Computer</button>
+    <span id="time-status" class="time-status">Ready.</span>
+  </div>
 </div>
 <div class="panel">
-  <h2>Current State</h2>
-  <p id="state-line">Loading...</p>
-  <p id="motion-line">Motion zones: loading...</p>
-  <pre id="raw-stats">{{}}</pre>
+  <h2>Runtime Stats</h2>
+  <div id="stats-grid" class="stats-grid"></div>
+  <h3>Raw Stats</h3>
+  <pre id="stats-raw">{stats_json}</pre>
+</div>
 </div>
 </div>
 <script>
 (() => {{
-  const ids = {{
-    captureFps: document.getElementById('capture-fps'),
-    processingFps: document.getElementById('processing-fps'),
-    streamFps: document.getElementById('stream-fps'),
-    recentGap: document.getElementById('recent-gap'),
-    gapStatus: document.getElementById('gap-status'),
-    maxGap: document.getElementById('max-gap'),
-    missedFrames: document.getElementById('missed-frames'),
-    readFailures: document.getElementById('read-failures'),
-    reconnects: document.getElementById('reconnects'),
-    stateLine: document.getElementById('state-line'),
-    motionLine: document.getElementById('motion-line'),
-    rawStats: document.getElementById('raw-stats'),
-  }};
+  const editor = document.getElementById('env-content');
+  const save = document.getElementById('env-save');
+  const saveApply = document.getElementById('env-save-apply');
+  const status = document.getElementById('env-status');
+  const statsGrid = document.getElementById('stats-grid');
+  const statsRaw = document.getElementById('stats-raw');
+  const settingsSystemClock = document.getElementById('settings-system-clock');
+  const settingsBrowserClock = document.getElementById('settings-browser-clock');
+  const timeSync = document.getElementById('time-sync');
+  const timeStatus = document.getElementById('time-status');
+  if (!editor || !save || !saveApply || !status || !statsGrid || !statsRaw || !settingsSystemClock || !settingsBrowserClock || !timeSync || !timeStatus) return;
 
-  function number(value, digits = 1) {{
-    if (value === null || value === undefined || Number.isNaN(Number(value))) return 'n/a';
-    return Number(value).toFixed(digits);
+  function setStatus(text, isError = false) {{
+    status.textContent = text;
+    status.className = isError ? 'config-status error' : 'config-status';
   }}
 
-  function seconds(value) {{
-    return `${{number(value, 2)}}s`;
+  function setTimeStatus(text, isError = false) {{
+    timeStatus.textContent = text;
+    timeStatus.className = isError ? 'time-status error' : 'time-status';
   }}
 
-  function setGapStatus(gap) {{
-    ids.gapStatus.className = 'hint status-ok';
-    ids.gapStatus.textContent = 'No recent stalls';
-    if (gap >= 2) {{
-      ids.gapStatus.className = 'hint status-bad';
-      ids.gapStatus.textContent = 'Large capture pause';
-    }} else if (gap >= 1) {{
-      ids.gapStatus.className = 'hint status-warn';
-      ids.gapStatus.textContent = 'Capture is uneven';
-    }}
+  function formatValue(value) {{
+    if (typeof value === 'number') return Number.isInteger(value) ? String(value) : value.toFixed(2);
+    if (value === null || value === undefined) return 'n/a';
+    return String(value);
+  }}
+
+  function renderStats(stats) {{
+    const keys = [
+      'motion_status',
+      'uptime_seconds',
+      'camera_fps_estimate',
+      'capture_fps',
+      'processing_fps',
+      'stream_fps',
+      'capture_frame_total',
+      'processing_frame_total',
+      'stream_frame_total',
+      'capture_gap_total',
+      'read_failure_total',
+      'capture_reconnect_total',
+      'last_capture_age_seconds',
+      'frame_width',
+      'capture_buffer_size',
+      'process_every_n_frames',
+      'recording_active',
+      'recording_fps',
+    ];
+    statsGrid.innerHTML = keys.map((key) => `
+      <div class="stat"><div class="stat-label">${{key.replaceAll('_', ' ')}}</div><div class="stat-value">${{formatValue(stats[key])}}</div></div>
+    `).join('');
+    statsRaw.textContent = JSON.stringify(stats, null, 2);
   }}
 
   async function refreshStats() {{
     try {{
       const response = await fetch('/api/stats', {{ cache: 'no-store' }});
-      const stats = await response.json();
-      if (!response.ok) throw new Error(stats.error || 'Stats failed');
-      ids.captureFps.textContent = number(stats.capture_fps);
-      ids.processingFps.textContent = number(stats.processing_fps);
-      ids.streamFps.textContent = `${{number(stats.stream_fps)}} / ${{number(stats.configured_stream_fps)}}`;
-      ids.recentGap.textContent = seconds(stats.recent_max_capture_gap_seconds);
-      ids.maxGap.textContent = seconds(stats.max_capture_gap_seconds);
-      ids.missedFrames.textContent = String(stats.estimated_missed_frames);
-      ids.readFailures.textContent = String(stats.read_failure_total);
-      ids.reconnects.textContent = String(stats.capture_reconnect_total);
-      setGapStatus(Number(stats.recent_max_capture_gap_seconds || 0));
-      ids.stateLine.textContent = `Camera estimate ${{number(stats.camera_fps_estimate)}} FPS, width ${{stats.frame_width}}, processing every ${{stats.process_every_n_frames}} frame(s), recording ${{stats.recording_active ? `active at ${{number(stats.recording_fps)}} FPS` : 'idle'}}, last frame age ${{seconds(stats.last_capture_age_seconds)}}.`;
-      ids.motionLine.textContent = stats.motion_status || 'Motion zones: waiting';
-      ids.rawStats.textContent = JSON.stringify(stats, null, 2);
+      if (!response.ok) return;
+      renderStats(await response.json());
     }} catch (error) {{
-      ids.stateLine.textContent = error.message || 'Unable to load stats';
-      ids.stateLine.className = 'status-bad';
+      // Keep the last stats visible if a refresh fails.
     }}
   }}
 
+  async function refreshSystemTime() {{
+    settingsBrowserClock.textContent = new Date().toLocaleString();
+    try {{
+      const response = await fetch('/api/time', {{ cache: 'no-store' }});
+      if (!response.ok) return;
+      const payload = await response.json();
+      settingsSystemClock.textContent = new Date(Number(payload.epoch_ms)).toLocaleString();
+    }} catch (error) {{
+      settingsSystemClock.textContent = 'Unavailable';
+    }}
+  }}
+
+  timeSync.addEventListener('click', async () => {{
+    setTimeStatus('Syncing...');
+    timeSync.disabled = true;
+    try {{
+      const response = await fetch('/api/time/sync', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{
+          epoch_ms: Date.now(),
+          timezone_offset_minutes: new Date().getTimezoneOffset(),
+          browser_time: new Date().toISOString(),
+        }}),
+      }});
+      const payload = await response.json();
+      if (!response.ok || !payload.ok) throw new Error(payload.error || payload.message || 'Clock sync failed');
+      setTimeStatus(payload.message || 'Clock synced.');
+      refreshSystemTime();
+    }} catch (error) {{
+      setTimeStatus(error.message || 'Clock sync failed', true);
+    }} finally {{
+      timeSync.disabled = false;
+    }}
+  }});
+
+  async function saveConfig(apply) {{
+    setStatus(apply ? 'Saving and applying...' : 'Saving...');
+    save.disabled = true;
+    saveApply.disabled = true;
+    try {{
+      const response = await fetch('/api/env', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ content: editor.value, apply }}),
+      }});
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || 'Save failed');
+      setStatus(payload.message || 'Saved.');
+      refreshStats();
+    }} catch (error) {{
+      setStatus(error.message || 'Save failed', true);
+    }} finally {{
+      save.disabled = false;
+      saveApply.disabled = false;
+    }}
+  }}
+
+  save.addEventListener('click', () => saveConfig(false));
+  saveApply.addEventListener('click', () => saveConfig(true));
   refreshStats();
-  window.setInterval(refreshStats, 1000);
+  refreshSystemTime();
+  setInterval(refreshStats, 5000);
+  setInterval(refreshSystemTime, 1000);
 }})();
 </script>
 </body></html>"""
@@ -2493,9 +3483,6 @@ button {{ background: #dc2626; color: white; border: 0; border-radius: 8px; padd
 {self._render_nav("images")}
 <h1>Captured images</h1>
 <p>Keeping only the newest {self.config.max_saved_images} images.</p>
-<form method="post" action="/api/images/clear" onsubmit="return confirm('Remove all saved images?');" style="margin: 16px 0 20px;">
-<button type="submit">Remove All Images</button>
-</form>
 <div class="grid">{gallery}</div>
 </div>
 </body></html>"""
@@ -2518,10 +3505,6 @@ button {{ background: #dc2626; color: white; border: 0; border-radius: 8px; padd
 <div class="page-shell">
 {self._render_nav("videos")}
 <h1>Saved videos</h1>
-<p>Videos start with at least {int(VIDEO_PREBUFFER_SECONDS)} seconds before the confirmed motion and run for {int(VIDEO_RECORDING_SECONDS // 60)} minutes. New motion does not create another video while one is already recording.</p>
-<form method="post" action="/api/videos/clear" onsubmit="return confirm('Remove all saved videos?');" style="margin: 16px 0 20px;">
-<button type="submit">Remove All Videos</button>
-</form>
 <div class="grid">{gallery}</div>
 </div>
 </body></html>"""
@@ -2538,10 +3521,10 @@ a {{ color: #93c5fd; }}
 .card img {{ width: 100%; border-radius: 10px; display: block; margin-top: 10px; }}
 .plate-code {{ font-size: 1.4rem; font-weight: 700; letter-spacing: 0.08em; }}
 .meta {{ color: #cbd5e1; margin-top: 6px; }}
-.page-action {{ display: inline-flex; align-items: center; margin: 0 0 18px; color: #111827; background: #facc15; border-radius: 8px; padding: 10px 14px; text-decoration: none; font-weight: 700; }}
+.page-action {{ display: inline-flex; align-items: center; justify-content: center; margin: 0 0 18px; color: #111827; background: #facc15; border-radius: 8px; padding: 10px 14px; text-decoration: none; font-weight: 700; width: 180px; min-height: 40px; }}
 .page-actions {{ display: flex; flex-wrap: wrap; gap: 10px; margin: 0 0 18px; }}
 .page-actions form {{ margin: 0; }}
-.telegram-action {{ background: #facc15; color: #111827; border: 0; border-radius: 8px; padding: 10px 14px; cursor: pointer; font-weight: 700; }}
+.telegram-action {{ background: #facc15; color: #111827; border: 0; border-radius: 8px; padding: 10px 14px; cursor: pointer; font-weight: 700; width: 180px; min-height: 40px; }}
 .danger-action {{ background: #dc2626; color: white; border: 0; border-radius: 8px; padding: 10px 14px; cursor: pointer; font-weight: 700; }}
 {self._render_shared_styles()}
 </style></head>
@@ -2553,9 +3536,6 @@ a {{ color: #93c5fd; }}
   <a class="page-action" href="/test">Test Upload</a>
   <form method="post" action="/api/telegram/test">
     <button class="telegram-action" type="submit">Send Telegram Test</button>
-  </form>
-  <form method="post" action="/api/plates/clear" onsubmit="return confirm('Remove all detected plates? Images and videos will stay saved.');">
-    <button class="danger-action" type="submit">Remove All Plates</button>
   </form>
 </div>
 <div class="grid">{cards}</div>
@@ -2653,6 +3633,71 @@ ul {{ padding-left: 20px; }}
 </div>
 </body></html>"""
 
+    def _render_saved_image_fast_alpr_result_page(self, relative_path: str, result: dict[str, Any], result_path: Path) -> str:
+        image_url = self._event_file_url(relative_path)
+        detail_url = self._image_detail_url(relative_path)
+        result_relative = result_path.relative_to(self.config.event_output_dir).as_posix()
+        result_url = self._event_file_url(result_relative)
+        detections = self._extract_fast_alpr_detections(
+            result,
+            relative_path,
+            Path(relative_path).parent.as_posix(),
+            time.time(),
+        )
+        detections_html = "".join(
+            f"<li><strong>{html.escape(item.plate)}</strong> ({item.confidence:.2f})</li>"
+            for item in detections
+        ) or "<li>No plates detected.</li>"
+        result_text = json.dumps(result, indent=2)
+        return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>ALPR Image Check</title>
+<style>
+body {{ font-family: Arial, sans-serif; background: #020617; color: #e2e8f0; margin: 0; padding: 24px; }}
+a {{ color: #93c5fd; }}
+.layout {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; align-items: start; }}
+.panel {{ background: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 18px; }}
+img {{ width: 100%; border-radius: 8px; display: block; }}
+pre {{ white-space: pre-wrap; word-break: break-word; background: #0f172a; padding: 14px; border-radius: 8px; overflow-x: auto; }}
+@media (max-width: 960px) {{ .layout {{ grid-template-columns: 1fr; }} }}
+{self._render_shared_styles()}
+</style></head>
+<body>
+<div class="page-shell">
+{self._render_nav("images")}
+<p><a href="{detail_url}">Back to image</a></p>
+<h1>ALPR Image Check</h1>
+<div class="layout">
+<div class="panel"><img src="{image_url}" alt="{html.escape(relative_path)}"><p>{html.escape(Path(relative_path).name)}</p></div>
+<div class="panel">
+<h2>Detections</h2>
+<ul>{detections_html}</ul>
+<p><a href="{result_url}">Open raw fast-alpr JSON</a></p>
+<pre>{html.escape(result_text)}</pre>
+</div>
+</div>
+</div>
+</body></html>"""
+
+    def _render_saved_image_fast_alpr_error_page(self, message: str) -> str:
+        return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>ALPR Image Check Failed</title>
+<style>
+body {{ font-family: Arial, sans-serif; background: #020617; color: #e2e8f0; margin: 0; padding: 24px; }}
+a {{ color: #93c5fd; }}
+.panel {{ background: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 18px; max-width: 760px; }}
+{self._render_shared_styles()}
+</style></head>
+<body>
+<div class="page-shell">
+{self._render_nav("images")}
+<div class="panel">
+<h1>ALPR Image Check Failed</h1>
+<p>{html.escape(message)}</p>
+<p><a href="/images">Back to images</a></p>
+</div>
+</div>
+</body></html>"""
+
     def _handle_roi_update(self, handler: BaseHTTPRequestHandler) -> None:
         try:
             content_length = int(handler.headers.get("Content-Length", "0"))
@@ -2676,6 +3721,7 @@ ul {{ padding-left: 20px; }}
                     ) or zone.roi
                     zone.enabled = bool(zone_payload.get("enabled", zone.enabled))
                     zone.use_fast_alpr = bool(zone_payload.get("use_fast_alpr", zone.use_fast_alpr))
+                    zone.send_telegram = bool(zone_payload.get("send_telegram", zone.send_telegram))
                     seen_zone_ids.add(zone_id)
                 if "yellow" not in seen_zone_ids:
                     raise ValueError("Yellow zone is required")
@@ -2728,6 +3774,215 @@ ul {{ padding-left: 20px; }}
             handler.send_header("Content-Length", str(len(body)))
             handler.end_headers()
             handler.wfile.write(body)
+
+    def _handle_telegram_settings_update(self, handler: BaseHTTPRequestHandler) -> None:
+        try:
+            content_length = int(handler.headers.get("Content-Length", "0"))
+            payload = json.loads(handler.rfile.read(content_length) or b"{}")
+            if "enabled" not in payload:
+                raise ValueError("enabled is required")
+            enabled = payload.get("enabled")
+            if isinstance(enabled, str):
+                self.config.telegram_alerts_enabled = parse_bool(
+                    enabled,
+                    default=self.config.telegram_alerts_enabled,
+                )
+            else:
+                self.config.telegram_alerts_enabled = bool(enabled)
+            self._save_runtime_config()
+            body = json.dumps(self._telegram_settings_for_ui()).encode("utf-8")
+            handler.send_response(HTTPStatus.OK)
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+        except Exception as exc:
+            body = json.dumps({"error": str(exc)}).encode("utf-8")
+            handler.send_response(HTTPStatus.BAD_REQUEST)
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+
+    def _system_time_snapshot(self) -> dict[str, Any]:
+        now = datetime.now().astimezone()
+        return {
+            "epoch_ms": int(time.time() * 1000),
+            "iso": now.isoformat(timespec="seconds"),
+            "local_text": now.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "timezone": time.tzname[time.localtime().tm_isdst > 0],
+        }
+
+    def _format_system_time(self, epoch_seconds: float) -> str:
+        return datetime.fromtimestamp(epoch_seconds).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    def _add_event_log(self, category: str, message: str) -> None:
+        entry = {
+            "time_epoch": time.time(),
+            "category": category,
+            "message": message,
+        }
+        with self.event_log_lock:
+            self.event_log.append(entry)
+
+    def _event_log_snapshot(self) -> List[dict[str, Any]]:
+        with self.event_log_lock:
+            entries = list(self.event_log)
+        return [
+            {
+                **entry,
+                "time_text": self._format_system_time(float(entry["time_epoch"])),
+            }
+            for entry in reversed(entries)
+        ]
+
+    def _render_event_log_items(self) -> str:
+        entries = self._event_log_snapshot()
+        if not entries:
+            return '<div class="event-log-empty">No events logged yet.</div>'
+        return "".join(
+            f'<div class="event-log-item"><span class="event-log-time">{html.escape(entry["time_text"])}</span>'
+            f'<span class="event-log-kind">{html.escape(str(entry["category"]))}</span>'
+            f'<span class="event-log-message">{html.escape(str(entry["message"]))}</span></div>'
+            for entry in entries
+        )
+
+    def _handle_system_time_sync(self, handler: BaseHTTPRequestHandler) -> None:
+        try:
+            content_length = int(handler.headers.get("Content-Length", "0"))
+            payload = json.loads(handler.rfile.read(content_length) or b"{}")
+            epoch_ms = float(payload.get("epoch_ms"))
+            epoch_seconds = epoch_ms / 1000.0
+            target_time = datetime.fromtimestamp(epoch_seconds)
+            if target_time.year < 2020 or target_time.year > 2100:
+                raise ValueError("Computer time is outside the allowed range")
+            result = subprocess.run(
+                ["date", "-s", f"@{epoch_seconds:.3f}"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                error = (result.stderr or result.stdout or "date command failed").strip()
+                raise PermissionError(
+                    f"Could not set the system clock: {error}. "
+                    "The Docker container may need SYS_TIME permission or host-level time sync."
+                )
+            body = json.dumps(
+                {
+                    "ok": True,
+                    "message": "System clock synced with this computer.",
+                    "time": self._system_time_snapshot(),
+                }
+            ).encode("utf-8")
+            handler.send_response(HTTPStatus.OK)
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+        except Exception as exc:
+            body = json.dumps({"ok": False, "error": str(exc)}).encode("utf-8")
+            handler.send_response(HTTPStatus.BAD_REQUEST)
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+
+    def _handle_env_update(self, handler: BaseHTTPRequestHandler) -> None:
+        try:
+            content_length = int(handler.headers.get("Content-Length", "0"))
+            if content_length > 256 * 1024:
+                raise ValueError(".env content is too large")
+            payload = json.loads(handler.rfile.read(content_length) or b"{}")
+            content = payload.get("content")
+            if not isinstance(content, str):
+                raise ValueError("content is required")
+            if "\x00" in content:
+                raise ValueError(".env content cannot contain null bytes")
+            apply_runtime = bool(payload.get("apply", False))
+            env_path = self._env_file_path()
+            env_path.parent.mkdir(parents=True, exist_ok=True)
+            if env_path.exists():
+                env_path.with_suffix(env_path.suffix + ".bak").write_text(env_path.read_text())
+            env_path.write_text(content)
+            apply_result: dict[str, Any] = {}
+            if apply_runtime:
+                apply_result = self._apply_env_content_to_runtime(content)
+            message = "Saved."
+            if apply_runtime:
+                message = "Saved and applied to runtime."
+                if apply_result.get("restart_needed"):
+                    restart_names = ", ".join(apply_result["restart_needed"])
+                    message += f" Restart needed for: {restart_names}."
+            body = json.dumps(
+                {
+                    "saved": True,
+                    "applied": apply_runtime,
+                    "path": str(env_path),
+                    "message": message,
+                    "changed": apply_result.get("changed", []),
+                    "restart_needed": apply_result.get("restart_needed", []),
+                }
+            ).encode("utf-8")
+            handler.send_response(HTTPStatus.OK)
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+        except Exception as exc:
+            body = json.dumps({"error": str(exc)}).encode("utf-8")
+            handler.send_response(HTTPStatus.BAD_REQUEST)
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+
+    def _apply_env_content_to_runtime(self, content: str) -> dict[str, Any]:
+        parsed_values = dotenv_values(stream=StringIO(content))
+        env_values = {
+            key: "" if value is None else str(value)
+            for key, value in parsed_values.items()
+            if key
+        }
+        new_config = Config.from_mapping(env_values)
+        old_config = self.config
+        changed = [
+            field_name
+            for field_name in Config.__dataclass_fields__
+            if getattr(old_config, field_name) != getattr(new_config, field_name)
+        ]
+        restart_needed = [
+            name
+            for name in changed
+            if name in {"web_host", "web_port", "rtsp_url", "rtsp_capture_options", "capture_buffer_size"}
+        ]
+        self.config = new_config
+        self.client = OpenAlprClient(self.config)
+        self.config.event_output_dir.mkdir(parents=True, exist_ok=True)
+        self.runtime_config_path = self.config.event_output_dir.parent / "watcher-config.json"
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self.config.rtsp_capture_options
+        for key, value in env_values.items():
+            os.environ[key] = value
+
+        primary_zone = self._find_motion_zone("yellow")
+        if primary_zone and self.config.roi:
+            primary_zone.roi = self.config.roi
+        if (
+            "TELEGRAM_ALERTS_ENABLED" in env_values
+            and old_config.telegram_alerts_enabled != self.config.telegram_alerts_enabled
+        ):
+            for zone in self.motion_zones:
+                zone.send_telegram = self.config.telegram_alerts_enabled
+        self._sync_primary_zone_to_config()
+        self._save_runtime_config()
+        self._prune_saved_images()
+        logging.info(
+            "Applied runtime environment configuration: changed=%s restart_needed=%s",
+            ",".join(changed) or "none",
+            ",".join(restart_needed) or "none",
+        )
+        return {"changed": changed, "restart_needed": restart_needed}
 
     def _serve_event_file(self, handler: BaseHTTPRequestHandler, relative_path: str) -> None:
         safe_relative = Path(unquote(relative_path))
@@ -2855,6 +4110,127 @@ a {{ color: #93c5fd; }}
         handler.end_headers()
         handler.wfile.write(body)
 
+    def _saved_image_path_from_relative(self, relative_path: str) -> Path:
+        safe_relative = Path(unquote(relative_path))
+        target = (self.config.event_output_dir / safe_relative).resolve()
+        base = self.config.event_output_dir.resolve()
+        if base not in target.parents or target.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+            raise ValueError("Invalid image path")
+        if not target.exists() or not target.is_file():
+            raise ValueError("Image file was not found")
+        return target
+
+    def _handle_saved_image_fast_alpr(self, handler: BaseHTTPRequestHandler) -> None:
+        try:
+            content_length = int(handler.headers.get("Content-Length", "0"))
+            raw_body = handler.rfile.read(content_length)
+            if handler.headers.get("Content-Type", "").startswith("application/json"):
+                payload = json.loads(raw_body or b"{}")
+                relative_path = str(payload.get("path") or "")
+            else:
+                payload = parse_qs(raw_body.decode("utf-8", errors="replace"))
+                relative_path = str((payload.get("path") or [""])[0])
+            image_path = self._saved_image_path_from_relative(relative_path)
+            if not self.config.fast_alpr_url:
+                raise ValueError("FAST_ALPR_URL is not configured")
+            image_bytes = image_path.read_bytes()
+            result = self._recognize_fast_alpr(image_bytes)
+            result_path = image_path.with_name(f"{image_path.stem}.manual_fast_alpr.json")
+            result_path.write_text(json.dumps(result, indent=2))
+            relative = image_path.relative_to(self.config.event_output_dir).as_posix()
+            body = self._render_saved_image_fast_alpr_result_page(relative, result, result_path).encode("utf-8")
+            handler.send_response(HTTPStatus.OK)
+            handler.send_header("Content-Type", "text/html; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+        except Exception as exc:
+            body = self._render_saved_image_fast_alpr_error_page(str(exc)).encode("utf-8")
+            handler.send_response(HTTPStatus.BAD_REQUEST)
+            handler.send_header("Content-Type", "text/html; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+
+    def _saved_video_path_from_relative(self, relative_path: str) -> Path:
+        safe_relative = Path(unquote(relative_path))
+        target = (self.config.event_output_dir / safe_relative).resolve()
+        base = self.config.event_output_dir.resolve()
+        if base not in target.parents or target.suffix.lower() != ".mp4":
+            raise ValueError("Invalid video path")
+        if not target.exists() or not target.is_file():
+            raise ValueError("Video file was not found")
+        return target
+
+    def _handle_video_snapshot_fast_alpr(self, handler: BaseHTTPRequestHandler) -> None:
+        try:
+            if not self.config.fast_alpr_url:
+                raise ValueError("FAST_ALPR_URL is not configured")
+            form = cgi.FieldStorage(
+                fp=handler.rfile,
+                headers=handler.headers,
+                environ={
+                    "REQUEST_METHOD": "POST",
+                    "CONTENT_TYPE": handler.headers.get("Content-Type", ""),
+                },
+            )
+            image_item = form["image"] if "image" in form else None
+            if image_item is None or not getattr(image_item, "file", None):
+                raise ValueError("Missing snapshot image")
+            video_path_value = form.getfirst("video_path", "")
+            video_path = self._saved_video_path_from_relative(str(video_path_value))
+            image_bytes = image_item.file.read()
+            if not image_bytes:
+                raise ValueError("Snapshot image is empty")
+            frame_array = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame_array is None:
+                raise ValueError("Snapshot image is invalid")
+
+            position_seconds = 0.0
+            try:
+                position_seconds = float(form.getfirst("position_seconds", "0") or 0.0)
+            except ValueError:
+                position_seconds = 0.0
+
+            stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            event_name = f"{self.config.camera_name}_video_snapshot_{stamp}"
+            event_dir = self.config.event_output_dir / event_name
+            event_dir.mkdir(parents=True, exist_ok=True)
+            image_path = event_dir / "video_snapshot.jpg"
+            image_path.write_bytes(image_bytes)
+            (event_dir / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "camera_name": self.config.camera_name,
+                        "started_at_epoch": time.time(),
+                        "ended_at_epoch": time.time(),
+                        "trigger_count": 0,
+                        "saved_frames": 1,
+                        "clip_path": video_path.relative_to(self.config.event_output_dir).as_posix(),
+                        "video_snapshot": True,
+                        "video_position_seconds": position_seconds,
+                    },
+                    indent=2,
+                )
+            )
+            result = self._recognize_fast_alpr(image_bytes)
+            result_path = image_path.with_name(f"{image_path.stem}.manual_fast_alpr.json")
+            result_path.write_text(json.dumps(result, indent=2))
+            relative = image_path.relative_to(self.config.event_output_dir).as_posix()
+            body = self._render_saved_image_fast_alpr_result_page(relative, result, result_path).encode("utf-8")
+            handler.send_response(HTTPStatus.OK)
+            handler.send_header("Content-Type", "text/html; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+        except Exception as exc:
+            body = self._render_saved_image_fast_alpr_error_page(str(exc)).encode("utf-8")
+            handler.send_response(HTTPStatus.BAD_REQUEST)
+            handler.send_header("Content-Type", "text/html; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+
     def _list_saved_images(self) -> List[Path]:
         images = sorted(
             self.config.event_output_dir.glob("*/*.jpg"),
@@ -2862,6 +4238,36 @@ a {{ color: #93c5fd; }}
             reverse=True,
         )
         return images
+
+    def _saved_image_epoch(self, image_path: Path) -> float:
+        meta_path = image_path.with_name(f"{image_path.stem}.meta.json")
+        if meta_path.exists():
+            try:
+                payload = json.loads(meta_path.read_text())
+                detected_at_epoch = payload.get("detected_at_epoch")
+                if detected_at_epoch is not None:
+                    return float(detected_at_epoch)
+            except Exception:
+                pass
+
+        summary_path = image_path.parent / "summary.json"
+        if summary_path.exists():
+            try:
+                payload = json.loads(summary_path.read_text())
+                relative = image_path.relative_to(self.config.event_output_dir).as_posix()
+                for item in payload.get("zone_images") or []:
+                    if item.get("image_relative_path") == relative and item.get("source_frame_timestamp") is not None:
+                        return float(item["source_frame_timestamp"])
+                for key in ("started_at_epoch", "ended_at_epoch"):
+                    if payload.get(key) is not None:
+                        return float(payload[key])
+            except Exception:
+                pass
+
+        return image_path.stat().st_mtime
+
+    def _saved_image_time_text(self, image_path: Path) -> str:
+        return self._format_system_time(self._saved_image_epoch(image_path))
 
     def _list_recent_plate_detections(self, limit: int) -> List[PlateDetection]:
         detections: List[PlateDetection] = []
@@ -2893,7 +4299,7 @@ a {{ color: #93c5fd; }}
                     return detections
         return detections
 
-    def _render_recent_plate_cards(self, limit: int) -> str:
+    def _render_recent_plate_cards(self, limit: int, include_images: bool = True) -> str:
         detections = self._list_recent_plate_detections(limit)
         if not detections:
             return "<p>No plate detections yet.</p>"
@@ -2901,7 +4307,7 @@ a {{ color: #93c5fd; }}
         for detection in detections:
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(detection.detected_at_epoch))
             image_html = ""
-            if detection.image_relative_path:
+            if include_images and detection.image_relative_path:
                 image_path = self.config.event_output_dir / Path(detection.image_relative_path)
                 if image_path.exists() and image_path.is_file():
                     image_link = self._event_file_url(detection.image_relative_path)
@@ -2931,11 +4337,16 @@ a {{ color: #93c5fd; }}
                     policy_note = f"<p>Policy: {html.escape(str(policy))}</p>"
                 except Exception:
                     policy_note = ""
-            stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(image_path.stat().st_mtime))
+            stamp = self._saved_image_time_text(image_path)
             escaped_relative = html.escape(relative)
+            escaped_name = html.escape(image_path.name)
+            escaped_relative_attr = html.escape(relative, quote=True)
             cards.append(
                 f'<div class="card"><a href="{detail_link}"><img src="{image_url}" alt="{escaped_relative}"></a>'
-                f'<p><a href="{detail_link}">{escaped_relative}</a></p><p>{stamp}</p>{policy_note}</div>'
+                f'<p><a href="{detail_link}">{escaped_name}</a></p><p>{stamp}</p>{policy_note}'
+                f'<form method="post" action="/api/images/alpr" style="margin-top:10px;">'
+                f'<input type="hidden" name="path" value="{escaped_relative_attr}">'
+                f'<button type="submit">Send to ALPR</button></form></div>'
             )
         return "".join(cards) or "<p>No images saved yet.</p>"
 
@@ -2961,10 +4372,24 @@ a {{ color: #93c5fd; }}
         newer_relative = images[current_index - 1] if current_index > 0 else None
         older_relative = images[current_index + 1] if 0 <= current_index < len(images) - 1 else None
         image_url = self._event_file_url(relative)
+        stamp = self._saved_image_time_text(image_path)
         newer_link = self._image_detail_url(newer_relative) if newer_relative else ""
         older_link = self._image_detail_url(older_relative) if older_relative else ""
-        newer_html = f'<a href="{newer_link}">Newer image</a>' if newer_link else '<span>Newer image</span>'
-        older_html = f'<a href="{older_link}">Older image</a>' if older_link else '<span>Older image</span>'
+        back_icon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 19 4 12l7-7v4h9v6h-9v4Z"/></svg>'
+        open_icon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3h7v7h-2V6.41l-9.29 9.3-1.42-1.42 9.3-9.29H14V3Z"/><path d="M5 5h6v2H7v10h10v-4h2v6H5V5Z"/></svg>'
+        newer_icon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 5 8.5 12l7 7V5Z"/></svg>'
+        older_icon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8.5 5 7 7-7 7V5Z"/></svg>'
+        newer_html = (
+            f'<a class="icon-button" href="{newer_link}" aria-label="Newer image" title="Newer image">{newer_icon}</a>'
+            if newer_link
+            else f'<span class="icon-button disabled" aria-label="No newer image" title="No newer image">{newer_icon}</span>'
+        )
+        older_html = (
+            f'<a class="icon-button" href="{older_link}" aria-label="Older image" title="Older image">{older_icon}</a>'
+            if older_link
+            else f'<span class="icon-button disabled" aria-label="No older image" title="No older image">{older_icon}</span>'
+        )
+        escaped_relative_attr = html.escape(relative, quote=True)
         body = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Captured Image</title>
 <style>
@@ -2974,14 +4399,24 @@ a {{ color: #93c5fd; }}
 img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
 .detail-actions {{ display: flex; flex-wrap: wrap; gap: 12px; margin: 0 0 16px; color: #cbd5e1; }}
 .detail-actions span {{ color: #64748b; }}
+.icon-button {{ display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; border: 1px solid #334155; border-radius: 8px; background: #111827; color: #93c5fd; text-decoration: none; }}
+.icon-button svg {{ width: 22px; height: 22px; fill: currentColor; display: block; }}
+.icon-button:hover {{ background: #1f2937; color: #bfdbfe; }}
+.icon-button.disabled {{ opacity: 0.35; color: #94a3b8; pointer-events: none; }}
+.alpr-action {{ margin-top: 12px; }}
+.alpr-action button {{ background: #facc15; color: #111827; border: 0; border-radius: 8px; padding: 10px 14px; cursor: pointer; font-weight: 700; }}
 {self._render_shared_styles()}
 </style></head>
 <body>
 <div class="page-shell">
 {self._render_nav("images")}
-<div class="detail-actions"><a href="/images">Back to captured images</a><a href="{image_url}">Open image file</a>{newer_html}{older_html}</div>
+<div class="detail-actions"><a class="icon-button" href="/images" aria-label="Back to captured images" title="Back to captured images">{back_icon}</a><a class="icon-button" href="{image_url}" aria-label="Open image file" title="Open image file">{open_icon}</a>{newer_html}{older_html}</div>
 <h1>Captured image</h1>
-<div class="panel"><img src="{image_url}" alt="{html.escape(relative)}"><p>{html.escape(relative)}</p></div>
+<div class="panel"><p class="meta">System time: {html.escape(stamp)}</p><img src="{image_url}" alt="{html.escape(relative)}"><p>{html.escape(relative)}</p>
+<form class="alpr-action" method="post" action="/api/images/alpr">
+<input type="hidden" name="path" value="{escaped_relative_attr}">
+<button type="submit">Send to ALPR</button>
+</form></div>
 </div>
 <script>
 (() => {{
@@ -3057,6 +4492,10 @@ a {{ color: #93c5fd; }}
 .panel {{ background: #111827; border: 1px solid #1f2937; border-radius: 18px; padding: 18px; }}
 video {{ width: 100%; border-radius: 10px; display: block; background: #000; }}
 .detail-actions {{ display: flex; flex-wrap: wrap; gap: 12px; margin: 0 0 16px; }}
+.video-tools {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 12px; }}
+.video-tools button {{ background: #facc15; color: #111827; border: 0; border-radius: 8px; padding: 10px 14px; cursor: pointer; font-weight: 700; }}
+.video-tools span {{ color: #cbd5e1; }}
+.video-tools span.error {{ color: #fca5a5; }}
 {self._render_shared_styles()}
 </style></head>
 <body>
@@ -3064,8 +4503,62 @@ video {{ width: 100%; border-radius: 10px; display: block; background: #000; }}
 {self._render_nav("videos")}
 <div class="detail-actions"><a href="/videos">Back to saved videos</a><a href="{video_url}">Open video file</a></div>
 <h1>Saved video</h1>
-<div class="panel"><video controls autoplay src="{video_url}"></video><p>{html.escape(relative)}</p></div>
+<div class="panel">
+<video id="saved-video" controls autoplay src="{video_url}"></video>
+<div class="video-tools">
+  <button id="snapshot-alpr" type="button">Snapshot and Send to ALPR</button>
+  <span id="snapshot-status">Pause or seek, then send the visible frame.</span>
 </div>
+<p>{html.escape(relative)}</p>
+</div>
+</div>
+<script>
+(() => {{
+  const video = document.getElementById('saved-video');
+  const button = document.getElementById('snapshot-alpr');
+  const status = document.getElementById('snapshot-status');
+  const videoPath = {json.dumps(relative)};
+  if (!video || !button || !status) return;
+
+  function setStatus(text, isError = false) {{
+    status.textContent = text;
+    status.className = isError ? 'error' : '';
+  }}
+
+  button.addEventListener('click', async () => {{
+    if (!video.videoWidth || !video.videoHeight) {{
+      setStatus('Video frame is not ready yet.', true);
+      return;
+    }}
+    button.disabled = true;
+    setStatus('Creating snapshot...');
+    try {{
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const context = canvas.getContext('2d');
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.95));
+      if (!blob) throw new Error('Could not create snapshot');
+      const form = new FormData();
+      form.append('image', blob, 'video_snapshot.jpg');
+      form.append('video_path', videoPath);
+      form.append('position_seconds', String(video.currentTime || 0));
+      setStatus('Sending snapshot to ALPR...');
+      const response = await fetch('/api/videos/snapshot-alpr', {{ method: 'POST', body: form }});
+      const text = await response.text();
+      if (!response.ok) throw new Error(text || 'Snapshot ALPR failed');
+      document.open();
+      document.write(text);
+      document.close();
+    }} catch (error) {{
+      setStatus(error.message || 'Snapshot ALPR failed', true);
+    }} finally {{
+      button.disabled = false;
+    }}
+  }});
+}})();
+</script>
 </body></html>""".encode("utf-8")
         handler.send_response(HTTPStatus.OK)
         handler.send_header("Content-Type", "text/html; charset=utf-8")

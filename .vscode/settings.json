@@ -1,0 +1,4 @@
+{
+    "chat.agent.enabled": false,
+    "chat.checkpoints.enabled": false
+}

@@ -15,6 +15,7 @@ services:
       - "8080:8080"
     volumes:
       - /mnt/localdisk/pi-alpr:/data
+      - ./.env:/app/.env
     depends_on:
       fast-alpr:
         condition: service_healthy

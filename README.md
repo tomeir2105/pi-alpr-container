@@ -5,8 +5,8 @@ This project pulls an RTSP stream from your home camera, detects passing motion 
 It also exposes a local dashboard UI:
 
 - Unified dashboard: `http://127.0.0.1:8080/`
-- Live video with zoom/pan controls: `http://127.0.0.1:8080/live`
-- Stream statistics: `http://127.0.0.1:8080/stats`
+- Full-screen live video: `http://127.0.0.1:8080/live`
+- Configuration editor: `http://127.0.0.1:8080/stats`
 - Captured images: `http://127.0.0.1:8080/images`
 - Saved videos: `http://127.0.0.1:8080/videos`
 - Detected plates: `http://127.0.0.1:8080/plates`
@@ -77,18 +77,18 @@ When the watcher is running, open:
 ## Web UI
 
 - The dashboard shows the editable motion zones and motion sensitivity controls.
-- The live page shows a clean camera feed with zoom, pan, and reset controls.
-- The stats page tracks capture FPS, dashboard FPS, read failures, reconnects, and large capture gaps.
+- The live page shows only the camera feed full-screen.
+- The config page edits `.env`; recreate the watcher container after saving Docker env-file changes.
 - The images page opens image details in the same tab and supports keyboard navigation: left arrow for newer images, right arrow for older images.
 - The videos page opens video details in the same tab with the top menu still visible.
-- The images, videos, and plates pages include clear buttons for removing saved images, saved videos, or detected plate entries.
+- The top menu includes remove buttons for saved images, saved videos, and detected plate entries.
 - The plates page includes the detection test upload link.
 
 ## Tuning
 
 - `ROI` should cover only the driveway or road where cars pass.
 - Hikvision channel `101` is usually the high-resolution main stream; use `102` when the main stream smears or the host cannot decode it at camera FPS.
-- `ALPR_RTSP_URL` can point at the high-resolution `101` stream so ALPR receives sharper images while motion/live/video stay on the stable `102` stream.
+- `ALPR_RTSP_URL` should point at the high-resolution `101` stream so live view and saved event images use the sharper camera feed while motion detection can stay on `RTSP_URL`; Hikvision `.../Channels/102` URLs are automatically tried as `.../Channels/101` if `ALPR_RTSP_URL` is blank.
 - `PLATE_ROI` can be a tighter sub-zone where plates are expected to appear; this powers the zoom panel and crops frames before ALPR runs.
 - `FRAME_WIDTH=960` keeps processing, streaming, and recordings bounded. Use `0` only if the host has enough CPU/RAM for the camera's native resolution.
 - `MIN_MOTION_AREA` filters out tiny motion like rain, trees, and shadows.
@@ -99,15 +99,17 @@ When the watcher is running, open:
 - `POSTBUFFER_FRAMES` overrides `POSTBUFFER_SECONDS` if you prefer an exact frame count.
 - `EVENT_IDLE_SECONDS` is how long motion must stop before the event can close.
 - `EVENT_MAX_SECONDS` forces an event to close even if motion detection keeps reporting movement.
-- `UPLOAD_TOP_FRAMES` controls how many images are sampled across the event timeline.
+- `UPLOAD_TOP_FRAMES` controls how many images are sampled across the event timeline; the watcher always tries to save at least 10 images per kept event.
 - `UPLOAD_MIN_SHARPNESS` skips blurry frames when possible.
 - `FAST_ALPR_URL` enables local plate recognition before cloud upload.
 - `FAST_ALPR_MIN_CONFIDENCE` is the minimum local OCR confidence required before a frame is sent to OpenALPR.
-- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `TELEGRAM_ALERT_IMAGES` enable Telegram photo alerts for movement events.
+- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `TELEGRAM_ALERT_IMAGES` configure Telegram photo alerts for movement events.
+- `TELEGRAM_ALERTS_ENABLED` sets the startup default for per-zone Telegram alerts; the dashboard zone checkboxes can turn alerts on or off at runtime.
 - `PLATE_ROI` crops frames to the likely plate area before local/cloud ALPR and powers the zoomed monitoring panel.
 - `WEB_PORT` controls the local monitoring UI port.
 - `MAX_SAVED_IMAGES` limits how many JPG captures are kept across all events.
 - `STREAM_FPS` controls the dashboard MJPEG refresh rate without slowing the RTSP reader.
+- `ALPR_CAPTURE_FPS` controls how often the 101 stream is sampled for saved event images; `ALPR_CAPTURE_WARMUP_SECONDS` and `LIVE_STREAM_WARMUP_SECONDS` skip unstable frames right after opening 101.
 - `CAPTURE_BUFFER_SIZE` and `RTSP_CAPTURE_OPTIONS` favor stable TCP capture over lowest-latency capture to avoid H.264 smear from damaged reference frames.
 - `EVENT_OUTPUT_DIR` should stay `/data/events` in containers so files land on `/mnt/localdisk/pi-alpr/events`.
 
@@ -132,13 +134,16 @@ FAST_ALPR_MIN_CONFIDENCE=0.75
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 TELEGRAM_ALERT_IMAGES=3
+TELEGRAM_ALERTS_ENABLED=true
 WEB_PORT=8080
-MAX_SAVED_IMAGES=50
+MAX_SAVED_IMAGES=200
 FFMPEG_THREADS=1
-STREAM_FPS=5
+STREAM_FPS=3
 CAPTURE_BUFFER_SIZE=4
 RTSP_CAPTURE_OPTIONS=rtsp_transport;tcp|max_delay;2000000|stimeout;10000000
-ALPR_CAPTURE_FPS=2
+ALPR_CAPTURE_FPS=0.5
+ALPR_CAPTURE_WARMUP_SECONDS=1.5
+LIVE_STREAM_WARMUP_SECONDS=1.5
 EVENT_OUTPUT_DIR=/data/events
 PLATE_ROI=0.30,0.45,0.80,0.75
 ```
