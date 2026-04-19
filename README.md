@@ -111,7 +111,7 @@ When the watcher is running, open:
 - `POSTBUFFER_FRAMES` overrides `POSTBUFFER_SECONDS` if you prefer an exact frame count.
 - `EVENT_IDLE_SECONDS` is how long motion must stop before the event can close.
 - `EVENT_MAX_SECONDS` forces an event to close even if motion detection keeps reporting movement.
-- `UPLOAD_TOP_FRAMES` controls how many images are sampled across the event timeline; the watcher always tries to save at least 10 images per kept event.
+- `UPLOAD_TOP_FRAMES` controls how many images are sampled across the event/video timeline; the default keeps 240 images per kept event.
 - `UPLOAD_MIN_SHARPNESS` skips blurry frames when possible.
 - `FAST_ALPR_URL` enables local plate recognition before cloud upload.
 - `FAST_ALPR_MIN_CONFIDENCE` is the minimum local OCR confidence required before a frame is sent to OpenALPR.
@@ -119,7 +119,7 @@ When the watcher is running, open:
 - `TELEGRAM_ALERTS_ENABLED` sets the startup default for per-zone Telegram alerts; the dashboard zone checkboxes can turn alerts on or off at runtime.
 - `PLATE_ROI` crops frames to the likely plate area before local/cloud ALPR and powers the zoomed monitoring panel.
 - `WEB_PORT` controls the local monitoring UI port.
-- `MAX_SAVED_IMAGES` limits how many JPG captures are kept across all events.
+- `MAX_SAVED_IMAGES` limits how many JPG captures are kept across all events; the default keeps the newest 2000 images.
 - `STREAM_FPS` controls the dashboard MJPEG refresh rate without slowing the RTSP reader.
 - `ALPR_CAPTURE_FPS` controls how often the 101 stream is sampled for saved event images; `ALPR_CAPTURE_WARMUP_SECONDS` and `LIVE_STREAM_WARMUP_SECONDS` skip unstable frames right after opening 101.
 - `CAPTURE_BUFFER_SIZE` and `RTSP_CAPTURE_OPTIONS` favor stable TCP capture over lowest-latency capture to avoid H.264 smear from damaged reference frames.
@@ -163,7 +163,7 @@ PREBUFFER_SECONDS=2.0
 POSTBUFFER_SECONDS=5.0
 PREBUFFER_FRAMES=0
 POSTBUFFER_FRAMES=0
-UPLOAD_TOP_FRAMES=30
+UPLOAD_TOP_FRAMES=240
 UPLOAD_MIN_SHARPNESS=80.0
 FAST_ALPR_URL=http://fast-alpr:8090
 FAST_ALPR_MIN_CONFIDENCE=0.75
@@ -172,7 +172,7 @@ TELEGRAM_CHAT_ID=
 TELEGRAM_ALERT_IMAGES=3
 TELEGRAM_ALERTS_ENABLED=true
 WEB_PORT=8080
-MAX_SAVED_IMAGES=200
+MAX_SAVED_IMAGES=2000
 FFMPEG_THREADS=1
 STREAM_FPS=3
 CAPTURE_BUFFER_SIZE=4
@@ -194,7 +194,7 @@ Notes:
 - Set `PREBUFFER_FRAMES` or `POSTBUFFER_FRAMES` to `0` to use the time-based values instead.
 - If you want exactly 20 frames before the event and 15 frames after it, set `PREBUFFER_FRAMES=20` and `POSTBUFFER_FRAMES=15`.
 - With the default `POSTBUFFER_SECONDS=5.0`, the image event keeps collecting frames for 5 seconds after motion stops.
-- The images page keeps only the newest `MAX_SAVED_IMAGES` JPG files and removes older frame artifacts automatically.
+- The images page keeps only the newest `MAX_SAVED_IMAGES` JPG files, removes older frame artifacts automatically, and pages results so large image sets are not rendered all at once.
 - Event/test frame policy: crop to `PLATE_ROI` if set, run `fast-alpr`, and only send to OpenALPR if `fast-alpr` found a plate at or above `FAST_ALPR_MIN_CONFIDENCE`.
 
 ## Output
