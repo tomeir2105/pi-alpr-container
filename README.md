@@ -14,7 +14,8 @@ It also exposes a local dashboard UI:
 
 Persistent data is stored under:
 
-- `/mnt/localdisk/pi-alpr/events`
+- `/mnt/localdisk/pi-alpr/events/images`
+- `/mnt/localdisk/pi-alpr/events/videos`
 - `/mnt/localdisk/pi-alpr/fast-alpr-cache`
 
 ## How it works
@@ -39,12 +40,14 @@ Persistent data is stored under:
 ## Setup
 
 ```bash
-mkdir -p /mnt/localdisk/pi-alpr/events
+mkdir -p /mnt/localdisk/pi-alpr/events/images
+mkdir -p /mnt/localdisk/pi-alpr/events/videos
 mkdir -p /mnt/localdisk/pi-alpr/fast-alpr-cache
-cp .env.example .env
+mkdir -p /mnt/localdisk/pi-alpr/config
+cp .env.example /mnt/localdisk/pi-alpr/config/.env
 ```
 
-Edit `.env` and set:
+Edit `/mnt/localdisk/pi-alpr/config/.env` and set:
 
 - `RTSP_URL`
 - `OPENALPR_SECRET_KEY`
@@ -111,7 +114,10 @@ When the watcher is running, open:
 - `STREAM_FPS` controls the dashboard MJPEG refresh rate without slowing the RTSP reader.
 - `ALPR_CAPTURE_FPS` controls how often the 101 stream is sampled for saved event images; `ALPR_CAPTURE_WARMUP_SECONDS` and `LIVE_STREAM_WARMUP_SECONDS` skip unstable frames right after opening 101.
 - `CAPTURE_BUFFER_SIZE` and `RTSP_CAPTURE_OPTIONS` favor stable TCP capture over lowest-latency capture to avoid H.264 smear from damaged reference frames.
-- `EVENT_OUTPUT_DIR` should stay `/data/events` in containers so files land on `/mnt/localdisk/pi-alpr/events`.
+- `HOST_DATA_DIR` controls the host folder mounted into both containers as `/data`; keep it on `/mnt/localdisk` to avoid saving outputs on the OS disk.
+- `APP_ENV_FILE` controls the `.env` file mounted into the watcher; keep it under `/mnt/localdisk` so config saves from the UI stay off the OS disk.
+- `DOCKER_LOG_DRIVER=none` prevents Docker from persisting container stdout/stderr logs under Docker's data directory.
+- `EVENT_OUTPUT_DIR`, `IMAGE_OUTPUT_DIR`, and `VIDEO_OUTPUT_DIR` should stay under `/data` in containers so files land under `HOST_DATA_DIR`.
 
 ## Useful environment variables
 
@@ -144,7 +150,12 @@ RTSP_CAPTURE_OPTIONS=rtsp_transport;tcp|max_delay;2000000|stimeout;10000000
 ALPR_CAPTURE_FPS=0.5
 ALPR_CAPTURE_WARMUP_SECONDS=1.5
 LIVE_STREAM_WARMUP_SECONDS=1.5
+HOST_DATA_DIR=/mnt/localdisk/pi-alpr
+APP_ENV_FILE=/mnt/localdisk/pi-alpr/config/.env
+DOCKER_LOG_DRIVER=none
 EVENT_OUTPUT_DIR=/data/events
+IMAGE_OUTPUT_DIR=/data/events/images
+VIDEO_OUTPUT_DIR=/data/events/videos
 PLATE_ROI=0.30,0.45,0.80,0.75
 ```
 
@@ -158,10 +169,10 @@ Notes:
 
 ## Output
 
-Each event creates a directory under `/mnt/localdisk/pi-alpr/events`, for example:
+Each event creates an image directory under `/mnt/localdisk/pi-alpr/events/images`, for example:
 
 ```text
-/mnt/localdisk/pi-alpr/events/home-driveway_20260409T120000Z/
+/mnt/localdisk/pi-alpr/events/images/home-driveway_20260409T120000Z/
 ```
 
 Inside an event directory you will find:
@@ -178,6 +189,8 @@ Longer motion-triggered MP4 recordings are stored separately under:
 ```
 
 MP4 recordings are written through `ffmpeg` as H.264/yuv420p files and are first stored under `events/videos/recording-tmp/`. They move into the main videos directory only after the recording is closed cleanly.
+
+Docker image layers and container metadata are controlled by the Docker daemon storage location, usually `/var/lib/docker`. Move Docker's `data-root` to `/mnt/localdisk` at the host level if those must also avoid the OS disk.
 
 ## Important note
 

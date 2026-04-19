@@ -33,6 +33,7 @@ MAX_VIDEO_PREBUFFER_FRAMES = 30
 VIDEO_WRITER_QUEUE_SECONDS = 8.0
 DEFAULT_RTSP_CAPTURE_OPTIONS = "rtsp_transport;tcp|max_delay;2000000|stimeout;10000000"
 DEFAULT_ALPR_CAPTURE_FPS = 1.0
+GALLERY_PAGE_SIZE = 10
 
 
 def parse_bool(value: str, default: bool = False) -> bool:
@@ -72,6 +73,8 @@ class Config:
     upload_top_frames: int
     upload_min_sharpness: float
     event_output_dir: Path
+    image_output_dir: Path
+    video_output_dir: Path
     camera_name: str
     roi: Optional[Tuple[float, float, float, float]]
     plate_roi: Optional[Tuple[float, float, float, float]]
@@ -126,6 +129,10 @@ class Config:
         roi = parse_normalized_roi(getenv("ROI").strip(), "ROI")
         plate_roi = parse_normalized_roi(getenv("PLATE_ROI").strip(), "PLATE_ROI")
 
+        event_output_dir = Path(getenv("EVENT_OUTPUT_DIR", "./events")).expanduser()
+        image_output_dir = Path(getenv("IMAGE_OUTPUT_DIR", str(event_output_dir))).expanduser()
+        video_output_dir = Path(getenv("VIDEO_OUTPUT_DIR", str(event_output_dir / "videos"))).expanduser()
+
         return cls(
             rtsp_url=rtsp_url,
             alpr_rtsp_url=getenv("ALPR_RTSP_URL").strip(),
@@ -143,7 +150,9 @@ class Config:
             postbuffer_frames=max(0, int(getenv("POSTBUFFER_FRAMES", "0"))),
             upload_top_frames=max(1, int(getenv("UPLOAD_TOP_FRAMES", "30"))),
             upload_min_sharpness=float(getenv("UPLOAD_MIN_SHARPNESS", "80.0")),
-            event_output_dir=Path(getenv("EVENT_OUTPUT_DIR", "./events")).expanduser(),
+            event_output_dir=event_output_dir,
+            image_output_dir=image_output_dir,
+            video_output_dir=video_output_dir,
             camera_name=getenv("CAMERA_NAME", "camera").strip(),
             roi=roi,
             plate_roi=plate_roi,
@@ -473,6 +482,8 @@ class RtspVehicleWatcher:
         self.capture = None
         self.background = cv2.createBackgroundSubtractorMOG2(history=400, varThreshold=36, detectShadows=False)
         self.config.event_output_dir.mkdir(parents=True, exist_ok=True)
+        self.config.image_output_dir.mkdir(parents=True, exist_ok=True)
+        self.config.video_output_dir.mkdir(parents=True, exist_ok=True)
         self.frame_lock = threading.Condition()
         self.latest_frame_jpeg: Optional[bytes] = None
         self.latest_clean_frame_jpeg: Optional[bytes] = None
@@ -882,7 +893,7 @@ class RtspVehicleWatcher:
             self.prebuffer.popleft()
 
     def _video_output_dir(self) -> Path:
-        path = self.config.event_output_dir / "videos"
+        path = self.config.video_output_dir
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -890,6 +901,28 @@ class RtspVehicleWatcher:
         path = self._video_output_dir() / "recording-tmp"
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    def _relative_image_path(self, path: Path) -> str:
+        return path.relative_to(self.config.image_output_dir).as_posix()
+
+    def _relative_video_path(self, path: Path) -> str:
+        return path.relative_to(self.config.video_output_dir).as_posix()
+
+    def _image_path_from_relative(self, relative_path: str) -> Path:
+        safe_relative = Path(unquote(relative_path))
+        target = (self.config.image_output_dir / safe_relative).resolve()
+        base = self.config.image_output_dir.resolve()
+        if base not in target.parents and target != base:
+            raise ValueError("Invalid image path")
+        return target
+
+    def _video_path_from_relative(self, relative_path: str) -> Path:
+        safe_relative = Path(unquote(relative_path))
+        target = (self.config.video_output_dir / safe_relative).resolve()
+        base = self.config.video_output_dir.resolve()
+        if base not in target.parents and target != base:
+            raise ValueError("Invalid video path")
+        return target
 
     def _cleanup_stale_video_recordings(self) -> None:
         temp_dir = self._video_temp_dir()
@@ -1629,7 +1662,7 @@ class RtspVehicleWatcher:
         (event_dir / f"{base_name}.meta.json").write_text(
             json.dumps({"source": source, "detected_at_epoch": detected_at_epoch}, indent=2)
         )
-        relative_frame_path = frame_path.relative_to(self.config.event_output_dir).as_posix()
+        relative_frame_path = self._relative_image_path(frame_path)
 
         local_result = None
         fast_alpr_results = []
@@ -1727,7 +1760,7 @@ class RtspVehicleWatcher:
                 crop = self._zone_crop(candidate.frame, zone)
                 image_path = event_dir / f"zone_{zone.zone_id}_{index:02d}.jpg"
                 image_path.write_bytes(self._encode_jpeg(crop))
-                relative_path = image_path.relative_to(self.config.event_output_dir).as_posix()
+                relative_path = self._relative_image_path(image_path)
                 image_paths.append(image_path)
                 self._add_event_log("image", f"Saved {zone.zone_id} zone image {image_path.name} from local video")
                 summary.append(
@@ -1750,7 +1783,7 @@ class RtspVehicleWatcher:
 
     def _telegram_zone_image_paths(self, zone_image_paths: List[Path], zone_image_summary: List[dict[str, Any]]) -> List[Path]:
         image_path_by_relative = {
-            path.relative_to(self.config.event_output_dir).as_posix(): path
+            self._relative_image_path(path): path
             for path in zone_image_paths
         }
         telegram_paths: List[Path] = []
@@ -1824,7 +1857,7 @@ class RtspVehicleWatcher:
             return
 
         stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-        event_dir = self.config.event_output_dir / f"{self.config.camera_name}_{stamp}"
+        event_dir = self.config.image_output_dir / f"{self.config.camera_name}_{stamp}"
         event_dir.mkdir(parents=True, exist_ok=True)
         image_limit = self.config.upload_top_frames
         selected = self._extract_video_event_candidates(
@@ -1879,7 +1912,7 @@ class RtspVehicleWatcher:
             "trigger_count": event.trigger_count,
             "saved_frames": len(selected),
             "high_res_alpr_frames": sum(1 for candidate in selected if candidate.source == "alpr-rtsp"),
-            "clip_path": source_video_path.relative_to(self.config.event_output_dir).as_posix()
+            "clip_path": self._relative_video_path(source_video_path)
             if source_video_path
             else None,
             "image_source": "video" if source_video_path else "event-capture",
@@ -2332,10 +2365,12 @@ class RtspVehicleWatcher:
                     self._send_mjpeg_stream(plate_zoom=True)
                     return
                 if path == "/images":
-                    self._send_html(watcher._render_images_page())
+                    query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+                    self._send_html(watcher._render_images_page(watcher._page_from_query(query)))
                     return
                 if path == "/videos":
-                    self._send_html(watcher._render_videos_page())
+                    query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+                    self._send_html(watcher._render_videos_page(watcher._page_from_query(query)))
                     return
                 if path.startswith("/image-view/"):
                     watcher._serve_image_detail_page(self, path[len("/image-view/"):])
@@ -3117,7 +3152,7 @@ h1 { margin-top: 0; }
 
     def _render_home_page(self) -> str:
         recent = self._render_recent_plate_cards(limit=8, include_images=False)
-        gallery = self._render_image_cards(limit=8)
+        gallery = self._render_image_cards(self._list_saved_images()[:8])
         event_log = self._render_event_log_items()
         return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>ALPR Watcher</title>
@@ -3463,8 +3498,40 @@ pre {{ white-space: pre-wrap; word-break: break-word; background: #050c0b; paddi
 </script>
 </body></html>"""
 
-    def _render_images_page(self) -> str:
-        gallery = self._render_image_cards(limit=self.config.max_saved_images)
+    def _page_from_query(self, query: dict[str, List[str]]) -> int:
+        try:
+            return max(1, int((query.get("page") or ["1"])[0]))
+        except (TypeError, ValueError):
+            return 1
+
+    def _pagination_html(self, base_path: str, page: int, total_items: int, page_size: int) -> str:
+        if total_items <= page_size:
+            return ""
+        total_pages = max(1, (total_items + page_size - 1) // page_size)
+        previous_html = (
+            f'<a href="{base_path}?page={page - 1}">Previous</a>'
+            if page > 1
+            else '<span>Previous</span>'
+        )
+        next_html = (
+            f'<a href="{base_path}?page={page + 1}">Next</a>'
+            if page < total_pages
+            else '<span>Next</span>'
+        )
+        return (
+            '<nav class="pagination" aria-label="Gallery pages">'
+            f'{previous_html}<span>Page {page} of {total_pages}</span>{next_html}'
+            '</nav>'
+        )
+
+    def _render_images_page(self, page: int = 1) -> str:
+        images = self._list_saved_images()
+        total_images = len(images)
+        total_pages = max(1, (total_images + GALLERY_PAGE_SIZE - 1) // GALLERY_PAGE_SIZE)
+        page = min(max(1, page), total_pages)
+        start = (page - 1) * GALLERY_PAGE_SIZE
+        gallery = self._render_image_cards(images[start : start + GALLERY_PAGE_SIZE])
+        pagination = self._pagination_html("/images", page, total_images, GALLERY_PAGE_SIZE)
         return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Captured Images</title>
 <style>
@@ -3472,6 +3539,9 @@ body {{ font-family: Arial, sans-serif; background: #020617; color: #e2e8f0; mar
 a {{ color: #93c5fd; }}
 .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; }}
 .card {{ background: #111827; padding: 12px; border-radius: 14px; }}
+.pagination {{ display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 18px 0; }}
+.pagination a, .pagination span {{ border: 1px solid #334155; border-radius: 8px; padding: 8px 12px; text-decoration: none; }}
+.pagination span {{ color: #94a3b8; }}
 img {{ width: 100%; border-radius: 10px; display: block; }}
 video {{ width: 100%; border-radius: 10px; display: block; margin-top: 10px; background: #000; }}
 p {{ margin: 8px 0 0; word-break: break-word; }}
@@ -3483,12 +3553,20 @@ button {{ background: #dc2626; color: white; border: 0; border-radius: 8px; padd
 {self._render_nav("images")}
 <h1>Captured images</h1>
 <p>Keeping only the newest {self.config.max_saved_images} images.</p>
+{pagination}
 <div class="grid">{gallery}</div>
+{pagination}
 </div>
 </body></html>"""
 
-    def _render_videos_page(self) -> str:
-        gallery = self._render_video_cards(limit=100)
+    def _render_videos_page(self, page: int = 1) -> str:
+        videos = self._list_saved_videos()
+        total_videos = len(videos)
+        total_pages = max(1, (total_videos + GALLERY_PAGE_SIZE - 1) // GALLERY_PAGE_SIZE)
+        page = min(max(1, page), total_pages)
+        start = (page - 1) * GALLERY_PAGE_SIZE
+        gallery = self._render_video_cards(videos[start : start + GALLERY_PAGE_SIZE])
+        pagination = self._pagination_html("/videos", page, total_videos, GALLERY_PAGE_SIZE)
         return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Saved Videos</title>
 <style>
@@ -3496,6 +3574,9 @@ body {{ font-family: Arial, sans-serif; background: #020617; color: #e2e8f0; mar
 a {{ color: #93c5fd; }}
 .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 18px; }}
 .card {{ background: #111827; padding: 12px; border-radius: 14px; }}
+.pagination {{ display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 18px 0; }}
+.pagination a, .pagination span {{ border: 1px solid #334155; border-radius: 8px; padding: 8px 12px; text-decoration: none; }}
+.pagination span {{ color: #94a3b8; }}
 video {{ width: 100%; border-radius: 10px; display: block; background: #000; }}
 p {{ margin: 8px 0 0; word-break: break-word; }}
 button {{ background: #dc2626; color: white; border: 0; border-radius: 8px; padding: 10px 14px; cursor: pointer; }}
@@ -3505,7 +3586,9 @@ button {{ background: #dc2626; color: white; border: 0; border-radius: 8px; padd
 <div class="page-shell">
 {self._render_nav("videos")}
 <h1>Saved videos</h1>
+{pagination}
 <div class="grid">{gallery}</div>
+{pagination}
 </div>
 </body></html>"""
 
@@ -3636,7 +3719,7 @@ ul {{ padding-left: 20px; }}
     def _render_saved_image_fast_alpr_result_page(self, relative_path: str, result: dict[str, Any], result_path: Path) -> str:
         image_url = self._event_file_url(relative_path)
         detail_url = self._image_detail_url(relative_path)
-        result_relative = result_path.relative_to(self.config.event_output_dir).as_posix()
+        result_relative = self._relative_image_path(result_path)
         result_url = self._event_file_url(result_relative)
         detections = self._extract_fast_alpr_detections(
             result,
@@ -3960,6 +4043,8 @@ a {{ color: #93c5fd; }}
         self.config = new_config
         self.client = OpenAlprClient(self.config)
         self.config.event_output_dir.mkdir(parents=True, exist_ok=True)
+        self.config.image_output_dir.mkdir(parents=True, exist_ok=True)
+        self.config.video_output_dir.mkdir(parents=True, exist_ok=True)
         self.runtime_config_path = self.config.event_output_dir.parent / "watcher-config.json"
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self.config.rtsp_capture_options
         for key, value in env_values.items():
@@ -3985,12 +4070,16 @@ a {{ color: #93c5fd; }}
         return {"changed": changed, "restart_needed": restart_needed}
 
     def _serve_event_file(self, handler: BaseHTTPRequestHandler, relative_path: str) -> None:
-        safe_relative = Path(unquote(relative_path))
-        target = (self.config.event_output_dir / safe_relative).resolve()
-        base = self.config.event_output_dir.resolve()
-        if base not in target.parents and target != base:
+        candidates: List[Path] = []
+        for resolver in (self._image_path_from_relative, self._video_path_from_relative):
+            try:
+                candidates.append(resolver(relative_path))
+            except ValueError:
+                pass
+        if not candidates:
             handler.send_error(HTTPStatus.FORBIDDEN, "Forbidden")
             return
+        target = next((candidate for candidate in candidates if candidate.exists() and candidate.is_file()), candidates[0])
         if not target.exists() or not target.is_file():
             handler.send_error(HTTPStatus.NOT_FOUND, "Not found")
             return
@@ -4038,7 +4127,7 @@ a {{ color: #93c5fd; }}
         frame = self._resize_frame(frame_array)
         stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         event_name = f"{self.config.camera_name}_test_{stamp}"
-        event_dir = self.config.event_output_dir / event_name
+        event_dir = self.config.image_output_dir / event_name
         event_dir.mkdir(parents=True, exist_ok=True)
 
         pipeline = self._run_detection_pipeline(
@@ -4111,10 +4200,8 @@ a {{ color: #93c5fd; }}
         handler.wfile.write(body)
 
     def _saved_image_path_from_relative(self, relative_path: str) -> Path:
-        safe_relative = Path(unquote(relative_path))
-        target = (self.config.event_output_dir / safe_relative).resolve()
-        base = self.config.event_output_dir.resolve()
-        if base not in target.parents or target.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+        target = self._image_path_from_relative(relative_path)
+        if target.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
             raise ValueError("Invalid image path")
         if not target.exists() or not target.is_file():
             raise ValueError("Image file was not found")
@@ -4137,7 +4224,7 @@ a {{ color: #93c5fd; }}
             result = self._recognize_fast_alpr(image_bytes)
             result_path = image_path.with_name(f"{image_path.stem}.manual_fast_alpr.json")
             result_path.write_text(json.dumps(result, indent=2))
-            relative = image_path.relative_to(self.config.event_output_dir).as_posix()
+            relative = self._relative_image_path(image_path)
             body = self._render_saved_image_fast_alpr_result_page(relative, result, result_path).encode("utf-8")
             handler.send_response(HTTPStatus.OK)
             handler.send_header("Content-Type", "text/html; charset=utf-8")
@@ -4153,10 +4240,8 @@ a {{ color: #93c5fd; }}
             handler.wfile.write(body)
 
     def _saved_video_path_from_relative(self, relative_path: str) -> Path:
-        safe_relative = Path(unquote(relative_path))
-        target = (self.config.event_output_dir / safe_relative).resolve()
-        base = self.config.event_output_dir.resolve()
-        if base not in target.parents or target.suffix.lower() != ".mp4":
+        target = self._video_path_from_relative(relative_path)
+        if target.suffix.lower() != ".mp4":
             raise ValueError("Invalid video path")
         if not target.exists() or not target.is_file():
             raise ValueError("Video file was not found")
@@ -4194,7 +4279,7 @@ a {{ color: #93c5fd; }}
 
             stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
             event_name = f"{self.config.camera_name}_video_snapshot_{stamp}"
-            event_dir = self.config.event_output_dir / event_name
+            event_dir = self.config.image_output_dir / event_name
             event_dir.mkdir(parents=True, exist_ok=True)
             image_path = event_dir / "video_snapshot.jpg"
             image_path.write_bytes(image_bytes)
@@ -4206,7 +4291,7 @@ a {{ color: #93c5fd; }}
                         "ended_at_epoch": time.time(),
                         "trigger_count": 0,
                         "saved_frames": 1,
-                        "clip_path": video_path.relative_to(self.config.event_output_dir).as_posix(),
+                        "clip_path": self._relative_video_path(video_path),
                         "video_snapshot": True,
                         "video_position_seconds": position_seconds,
                     },
@@ -4216,7 +4301,7 @@ a {{ color: #93c5fd; }}
             result = self._recognize_fast_alpr(image_bytes)
             result_path = image_path.with_name(f"{image_path.stem}.manual_fast_alpr.json")
             result_path.write_text(json.dumps(result, indent=2))
-            relative = image_path.relative_to(self.config.event_output_dir).as_posix()
+            relative = self._relative_image_path(image_path)
             body = self._render_saved_image_fast_alpr_result_page(relative, result, result_path).encode("utf-8")
             handler.send_response(HTTPStatus.OK)
             handler.send_header("Content-Type", "text/html; charset=utf-8")
@@ -4233,7 +4318,7 @@ a {{ color: #93c5fd; }}
 
     def _list_saved_images(self) -> List[Path]:
         images = sorted(
-            self.config.event_output_dir.glob("*/*.jpg"),
+            self.config.image_output_dir.glob("*/*.jpg"),
             key=lambda item: item.stat().st_mtime,
             reverse=True,
         )
@@ -4254,7 +4339,7 @@ a {{ color: #93c5fd; }}
         if summary_path.exists():
             try:
                 payload = json.loads(summary_path.read_text())
-                relative = image_path.relative_to(self.config.event_output_dir).as_posix()
+                relative = self._relative_image_path(image_path)
                 for item in payload.get("zone_images") or []:
                     if item.get("image_relative_path") == relative and item.get("source_frame_timestamp") is not None:
                         return float(item["source_frame_timestamp"])
@@ -4272,7 +4357,7 @@ a {{ color: #93c5fd; }}
     def _list_recent_plate_detections(self, limit: int) -> List[PlateDetection]:
         detections: List[PlateDetection] = []
         summaries = sorted(
-            self.config.event_output_dir.glob("*/summary.json"),
+            self.config.image_output_dir.glob("*/summary.json"),
             key=lambda item: item.stat().st_mtime,
             reverse=True,
         )
@@ -4308,7 +4393,7 @@ a {{ color: #93c5fd; }}
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(detection.detected_at_epoch))
             image_html = ""
             if include_images and detection.image_relative_path:
-                image_path = self.config.event_output_dir / Path(detection.image_relative_path)
+                image_path = self.config.image_output_dir / Path(detection.image_relative_path)
                 if image_path.exists() and image_path.is_file():
                     image_link = self._event_file_url(detection.image_relative_path)
                     image_html = f'<a href="{image_link}"><img src="{image_link}" alt="{html.escape(detection.plate)}"></a>'
@@ -4322,10 +4407,10 @@ a {{ color: #93c5fd; }}
             )
         return "".join(cards)
 
-    def _render_image_cards(self, limit: int) -> str:
+    def _render_image_cards(self, images: List[Path]) -> str:
         cards = []
-        for image_path in self._list_saved_images()[:limit]:
-            relative = image_path.relative_to(self.config.event_output_dir).as_posix()
+        for image_path in images:
+            relative = self._relative_image_path(image_path)
             detail_link = self._image_detail_url(relative)
             image_url = self._event_file_url(relative)
             summary_path = image_path.parent / "summary.json"
@@ -4351,10 +4436,9 @@ a {{ color: #93c5fd; }}
         return "".join(cards) or "<p>No images saved yet.</p>"
 
     def _serve_image_detail_page(self, handler: BaseHTTPRequestHandler, relative_path: str) -> None:
-        safe_relative = Path(unquote(relative_path))
-        image_path = (self.config.event_output_dir / safe_relative).resolve()
-        base = self.config.event_output_dir.resolve()
-        if base not in image_path.parents:
+        try:
+            image_path = self._image_path_from_relative(relative_path)
+        except ValueError:
             handler.send_error(HTTPStatus.FORBIDDEN, "Forbidden")
             return
         if not image_path.exists() or not image_path.is_file():
@@ -4363,8 +4447,8 @@ a {{ color: #93c5fd; }}
         if image_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
             handler.send_error(HTTPStatus.FORBIDDEN, "Forbidden")
             return
-        relative = image_path.relative_to(self.config.event_output_dir).as_posix()
-        images = [path.relative_to(self.config.event_output_dir).as_posix() for path in self._list_saved_images()]
+        relative = self._relative_image_path(image_path)
+        images = [self._relative_image_path(path) for path in self._list_saved_images()]
         try:
             current_index = images.index(relative)
         except ValueError:
@@ -4442,10 +4526,10 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
             reverse=True,
         )
 
-    def _render_video_cards(self, limit: int) -> str:
+    def _render_video_cards(self, videos: List[Path]) -> str:
         cards = []
-        for video_path in self._list_saved_videos()[:limit]:
-            relative = video_path.relative_to(self.config.event_output_dir).as_posix()
+        for video_path in videos:
+            relative = self._relative_video_path(video_path)
             video_url = self._event_file_url(relative)
             detail_url = self._video_detail_url(relative)
             metadata_path = video_path.with_suffix(".json")
@@ -4470,10 +4554,9 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
         return "".join(cards) or "<p>No videos saved yet.</p>"
 
     def _serve_video_detail_page(self, handler: BaseHTTPRequestHandler, relative_path: str) -> None:
-        safe_relative = Path(unquote(relative_path))
-        video_path = (self.config.event_output_dir / safe_relative).resolve()
-        base = self.config.event_output_dir.resolve()
-        if base not in video_path.parents:
+        try:
+            video_path = self._video_path_from_relative(relative_path)
+        except ValueError:
             handler.send_error(HTTPStatus.FORBIDDEN, "Forbidden")
             return
         if not video_path.exists() or not video_path.is_file():
@@ -4482,7 +4565,7 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
         if video_path.suffix.lower() != ".mp4":
             handler.send_error(HTTPStatus.FORBIDDEN, "Forbidden")
             return
-        relative = video_path.relative_to(self.config.event_output_dir).as_posix()
+        relative = self._relative_video_path(video_path)
         video_url = self._event_file_url(relative)
         body = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Saved Video</title>
@@ -4580,10 +4663,8 @@ video {{ width: 100%; border-radius: 10px; display: block; background: #000; }}
 
     def _handle_clear_images(self, handler: BaseHTTPRequestHandler) -> None:
         try:
-            for event_dir in self.config.event_output_dir.iterdir():
+            for event_dir in self.config.image_output_dir.iterdir():
                 if event_dir.is_dir():
-                    if event_dir.name == "videos":
-                        continue
                     shutil.rmtree(event_dir, ignore_errors=True)
             if handler.headers.get("Content-Type", "").startswith("application/json"):
                 body = json.dumps({"cleared": True}).encode("utf-8")
@@ -4637,7 +4718,7 @@ video {{ width: 100%; border-radius: 10px; display: block; background: #000; }}
     def _handle_clear_plates(self, handler: BaseHTTPRequestHandler) -> None:
         try:
             cleared = 0
-            for summary_path in self.config.event_output_dir.glob("*/summary.json"):
+            for summary_path in self.config.image_output_dir.glob("*/summary.json"):
                 try:
                     payload = json.loads(summary_path.read_text())
                 except Exception:
