@@ -54,6 +54,15 @@ Edit `/mnt/localdisk/pi-alpr/config/.env` and set:
 - `OPENALPR_COUNTRY`
 - `ROI`
 
+For Hikvision cameras, a typical stream setup is:
+
+```dotenv
+RTSP_URL=rtsp://username:password@camera-host:554/Streaming/Channels/102
+ALPR_RTSP_URL=rtsp://username:password@camera-host:554/Streaming/Channels/101
+```
+
+Use channel `102` for the lighter motion stream and channel `101` for sharper ALPR images.
+
 If you want local filtering before OpenALPR, also set:
 
 - `FAST_ALPR_URL`
@@ -118,6 +127,27 @@ When the watcher is running, open:
 - `APP_ENV_FILE` controls the `.env` file mounted into the watcher; keep it under `/mnt/localdisk` so config saves from the UI stay off the OS disk.
 - `DOCKER_LOG_DRIVER=none` prevents Docker from persisting container stdout/stderr logs under Docker's data directory.
 - `EVENT_OUTPUT_DIR`, `IMAGE_OUTPUT_DIR`, and `VIDEO_OUTPUT_DIR` should stay under `/data` in containers so files land under `HOST_DATA_DIR`.
+
+## RTSP authentication
+
+If the dashboard opens but the camera feed never appears, test the RTSP URL from inside the watcher container:
+
+```bash
+docker exec -it pi-alpr-watcher ffprobe -rtsp_transport tcp \
+  -select_streams v:0 \
+  -show_entries stream=codec_name,width,height,avg_frame_rate \
+  -of default=noprint_wrappers=1 \
+  "$RTSP_URL"
+```
+
+`401 Unauthorized` means Docker can reach the camera, but the camera rejected RTSP authentication. On Hikvision cameras, check the camera web UI and set RTSP authentication to `Digest/Basic` or `Basic/Digest`, then recreate the watcher container:
+
+```bash
+cd /mnt/localdisk/pi-alpr/app
+docker compose up -d --force-recreate watcher
+```
+
+The active runtime config is `/mnt/localdisk/pi-alpr/config/.env`. Keep real camera passwords and API keys only in `.env`; do not commit them.
 
 ## Useful environment variables
 
