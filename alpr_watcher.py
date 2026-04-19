@@ -333,6 +333,7 @@ class DirectRtspVideoRecorder:
                 "+faststart",
                 str(output_path),
             ],
+            stdin=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
 
@@ -341,7 +342,15 @@ class DirectRtspVideoRecorder:
 
     def release(self) -> None:
         if self.process.poll() is None:
-            self.process.terminate()
+            if self.process.stdin:
+                try:
+                    self.process.stdin.write(b"q\n")
+                    self.process.stdin.flush()
+                    self.process.stdin.close()
+                except Exception:
+                    self.process.terminate()
+            else:
+                self.process.terminate()
             try:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
@@ -1085,14 +1094,21 @@ class RtspVehicleWatcher:
         finally:
             self.video_recording = None
         if release_error:
-            recording.temp_output_path.unlink(missing_ok=True)
-            logging.error(
-                "Failed to close video recording %s",
+            if not self._video_file_is_readable(recording.temp_output_path):
+                recording.temp_output_path.unlink(missing_ok=True)
+                logging.error(
+                    "Failed to close video recording %s",
+                    recording.output_path,
+                    exc_info=(type(release_error), release_error, release_error.__traceback__),
+                )
+                self._add_event_log("video", f"Failed to close video {recording.output_path.name}")
+                return
+            logging.warning(
+                "Video recorder reported close error for %s, but the temp MP4 is readable; keeping it: %s",
                 recording.output_path,
-                exc_info=(type(release_error), release_error, release_error.__traceback__),
+                release_error,
             )
-            self._add_event_log("video", f"Failed to close video {recording.output_path.name}")
-            return
+            self._add_event_log("video", f"Recovered readable video {recording.output_path.name} after close warning")
         if not recording.confirmed:
             recording.temp_output_path.unlink(missing_ok=True)
             logging.info("Discarded unconfirmed video recording %s", recording.temp_output_path)
@@ -1115,6 +1131,30 @@ class RtspVehicleWatcher:
                 daemon=True,
             )
             thread.start()
+
+    def _video_file_is_readable(self, video_path: Path) -> bool:
+        if not video_path.exists() or not video_path.is_file() or video_path.stat().st_size <= 0:
+            return False
+        if not shutil.which("ffprobe"):
+            return True
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        return result.returncode == 0 and b"video" in result.stdout
 
     def _discard_unconfirmed_video_recording(self) -> None:
         recording = self.video_recording
