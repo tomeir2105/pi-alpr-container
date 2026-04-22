@@ -7,6 +7,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -16,7 +17,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 from pathlib import Path
-from urllib.parse import parse_qs, quote, unquote
+from urllib.parse import parse_qs, quote, unquote, urlencode
 from typing import Any, Deque, List, Optional, Tuple
 
 import cv2
@@ -33,7 +34,7 @@ MAX_VIDEO_PREBUFFER_FRAMES = 30
 VIDEO_WRITER_QUEUE_SECONDS = 8.0
 DEFAULT_RTSP_CAPTURE_OPTIONS = "rtsp_transport;tcp|max_delay;2000000|stimeout;10000000"
 DEFAULT_ALPR_CAPTURE_FPS = 1.0
-GALLERY_PAGE_SIZE = 10
+GALLERY_PAGE_SIZE = 24
 
 
 def parse_bool(value: str, default: bool = False) -> bool:
@@ -1892,25 +1893,42 @@ class RtspVehicleWatcher:
             return
 
         if source_video_path is None or source_video_first_frame_at is None:
-            logging.error("Skipping motion-event images because no finalized local video is available")
-            self._add_event_log("image", "Skipped motion-event images: no finalized local video available")
-            return
+            logging.warning("No finalized local video is available; using in-memory event frames instead")
+            self._add_event_log("image", "No finalized local video is available; using in-memory event frames instead")
+            source_video_path = None
+            source_video_first_frame_at = None
 
         stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         event_dir = self.config.image_output_dir / f"{self.config.camera_name}_{stamp}"
         event_dir.mkdir(parents=True, exist_ok=True)
         image_limit = self.config.upload_top_frames
-        selected = self._extract_video_event_candidates(
-            source_video_path,
-            source_video_first_frame_at,
-            event,
-            image_limit,
-        )
+        event_start_at = event.frames[0][0] if event.frames else event.started_at
+        selected: List[CandidateFrame] = []
+        if source_video_path is not None and source_video_first_frame_at is not None:
+            selected = self._extract_video_event_candidates(
+                source_video_path,
+                source_video_first_frame_at,
+                event_start_at,
+                event.last_frame_at,
+                event,
+                image_limit,
+            )
         if not selected:
-            logging.error("No images extracted from %s. Skipping motion-event image creation.", source_video_path)
-            self._add_event_log("image", f"Skipped event images: no frames extracted from {source_video_path.name}")
-            self._prune_saved_images()
-            return
+            selected = self._fallback_event_candidates(event)
+            if selected:
+                logging.warning(
+                    "Falling back to in-memory event frames for %s because video extraction returned no frames",
+                    source_video_path or "current event",
+                )
+                self._add_event_log("image", "Falling back to in-memory event frames because video extraction returned no images")
+            else:
+                logging.error("No images extracted from %s. Skipping motion-event image creation.", source_video_path or "current event")
+                if source_video_path is not None:
+                    self._add_event_log("image", f"Skipped event images: no frames extracted from {source_video_path.name}")
+                else:
+                    self._add_event_log("image", "Skipped event images: no frames were available")
+                self._prune_saved_images()
+                return
         openalpr_results = []
         fast_alpr_results = []
         plate_detections: List[PlateDetection] = []
@@ -1955,7 +1973,7 @@ class RtspVehicleWatcher:
             "clip_path": self._relative_video_path(source_video_path)
             if source_video_path
             else None,
-            "image_source": "video" if source_video_path else "event-capture",
+            "image_source": "video" if selected and all(candidate.source == "video" for candidate in selected) else "event-capture",
             "triggered_zones": self._event_zone_summary(event),
             "event_policy": "fast-alpr" if alpr_enabled else "images-only",
             "zone_images": zone_image_summary,
@@ -1966,7 +1984,7 @@ class RtspVehicleWatcher:
         (event_dir / "summary.json").write_text(json.dumps(summary, indent=2))
         self._add_event_log(
             "image",
-            f"Saved {len(selected)} images from local video into {event_dir.name}",
+            f"Saved {len(selected)} images into {event_dir.name}",
         )
         if self._event_sends_telegram(event):
             telegram_zone_images = self._telegram_zone_image_paths(zone_image_paths, zone_image_summary)
@@ -2075,23 +2093,43 @@ class RtspVehicleWatcher:
             for index in range(limit)
         ]
 
+    def _fallback_event_candidates(self, event: Event) -> List[CandidateFrame]:
+        selected = self._select_best_frames(event)
+        fallback_candidates: List[CandidateFrame] = []
+        for candidate in selected:
+            jpeg_bytes = candidate.jpeg_bytes or self._encode_jpeg(candidate.frame)
+            fallback_candidates.append(
+                CandidateFrame(
+                    frame=candidate.frame.copy(),
+                    timestamp=candidate.timestamp,
+                    motion_area=candidate.motion_area,
+                    sharpness=candidate.sharpness,
+                    jpeg_bytes=jpeg_bytes,
+                    source=candidate.source,
+                    zone_ids=set(candidate.zone_ids),
+                )
+            )
+        return fallback_candidates
+
     def _extract_video_event_candidates(
         self,
         video_path: Path,
         first_frame_at: float,
+        start_at: float,
+        end_at: float,
         event: Event,
         limit: int,
     ) -> List[CandidateFrame]:
-        if limit <= 0:
+        if limit <= 0 or end_at < start_at:
             return []
         target_timestamps = self._video_extraction_timestamps(
-            first_frame_at,
-            max(first_frame_at, event.last_frame_at),
+            max(first_frame_at, start_at),
+            max(max(first_frame_at, start_at), end_at),
             limit,
         )
         self._add_event_log(
             "image",
-            f"Sampling {len(target_timestamps)} image timestamps from start of local video {video_path.name}",
+            f"Sampling {len(target_timestamps)} image timestamps from local video {video_path.name}",
         )
         capture = cv2.VideoCapture(str(video_path))
         if not capture.isOpened():
@@ -2410,7 +2448,12 @@ class RtspVehicleWatcher:
                     return
                 if path == "/videos":
                     query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
-                    self._send_html(watcher._render_videos_page(watcher._page_from_query(query)))
+                    self._send_html(
+                        watcher._render_videos_page(
+                            watcher._page_from_query(query),
+                            str((query.get("selected") or [""])[0]),
+                        )
+                    )
                     return
                 if path.startswith("/image-view/"):
                     watcher._serve_image_detail_page(self, path[len("/image-view/"):])
@@ -2440,6 +2483,12 @@ class RtspVehicleWatcher:
                 if path == "/api/videos/clear":
                     watcher._handle_clear_videos(self)
                     return
+                if path == "/api/videos/delete":
+                    watcher._handle_delete_video(self)
+                    return
+                if path == "/api/videos/extract-images":
+                    watcher._handle_video_extract_images(self)
+                    return
                 if path == "/api/plates/clear":
                     watcher._handle_clear_plates(self)
                     return
@@ -2460,6 +2509,9 @@ class RtspVehicleWatcher:
                     return
                 if path == "/api/videos/snapshot-alpr":
                     watcher._handle_video_snapshot_fast_alpr(self)
+                    return
+                if path == "/api/videos/quick-alpr":
+                    watcher._handle_video_quick_alpr(self)
                     return
                 if path == "/test":
                     watcher._handle_test_upload(self)
@@ -3544,25 +3596,46 @@ pre {{ white-space: pre-wrap; word-break: break-word; background: #050c0b; paddi
         except (TypeError, ValueError):
             return 1
 
-    def _pagination_html(self, base_path: str, page: int, total_items: int, page_size: int) -> str:
+    def _pagination_html(
+        self,
+        base_path: str,
+        page: int,
+        total_items: int,
+        page_size: int,
+        extra_params: Optional[dict[str, str]] = None,
+    ) -> str:
         if total_items <= page_size:
             return ""
         total_pages = max(1, (total_items + page_size - 1) // page_size)
+        extra_params = {key: value for key, value in (extra_params or {}).items() if value}
+
+        def page_href(target_page: int) -> str:
+            params = {"page": str(target_page)}
+            params.update(extra_params)
+            return f"{base_path}?{urlencode(params)}"
+
         previous_html = (
-            f'<a href="{base_path}?page={page - 1}">Previous</a>'
+            f'<a href="{page_href(page - 1)}">Previous</a>'
             if page > 1
             else '<span>Previous</span>'
         )
         next_html = (
-            f'<a href="{base_path}?page={page + 1}">Next</a>'
+            f'<a href="{page_href(page + 1)}">Next</a>'
             if page < total_pages
             else '<span>Next</span>'
         )
         return (
             '<nav class="pagination" aria-label="Gallery pages">'
-            f'{previous_html}<span>Page {page} of {total_pages}</span>{next_html}'
+            f'{previous_html}<span>Page {page} of {total_pages} pages</span>{next_html}'
             '</nav>'
         )
+
+    def _gallery_summary_html(self, page: int, total_items: int, page_size: int, label: str) -> str:
+        if total_items <= 0:
+            return f"<p>No {html.escape(label)} found.</p>"
+        start_index = ((page - 1) * page_size) + 1
+        end_index = min(total_items, page * page_size)
+        return f"<p>Showing {start_index}-{end_index} of {total_items} saved {html.escape(label)}.</p>"
 
     def _render_images_page(self, page: int = 1) -> str:
         images = self._list_saved_images()
@@ -3572,6 +3645,7 @@ pre {{ white-space: pre-wrap; word-break: break-word; background: #050c0b; paddi
         start = (page - 1) * GALLERY_PAGE_SIZE
         gallery = self._render_image_cards(images[start : start + GALLERY_PAGE_SIZE])
         pagination = self._pagination_html("/images", page, total_images, GALLERY_PAGE_SIZE)
+        summary = self._gallery_summary_html(page, total_images, GALLERY_PAGE_SIZE, "images")
         return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Captured Images</title>
 <style>
@@ -3579,13 +3653,18 @@ body {{ font-family: Arial, sans-serif; background: #020617; color: #e2e8f0; mar
 a {{ color: #93c5fd; }}
 .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; }}
 .card {{ background: #111827; padding: 12px; border-radius: 14px; }}
+.card-actions {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 8px; }}
+.card-filename {{ margin: 0; flex: 1; min-width: 0; }}
+.card-icon-form {{ margin: 0; flex-shrink: 0; }}
+.card-icon-button {{ display: inline-flex; align-items: center; justify-content: center; width: 38px; height: 38px; padding: 0; background: #facc15; color: #111827; border: 0; border-radius: 999px; cursor: pointer; }}
+.card-icon-button svg {{ width: 20px; height: 20px; fill: currentColor; display: block; }}
+.card-icon-button:hover {{ background: #fde047; }}
 .pagination {{ display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 18px 0; }}
 .pagination a, .pagination span {{ border: 1px solid #334155; border-radius: 8px; padding: 8px 12px; text-decoration: none; }}
 .pagination span {{ color: #94a3b8; }}
 img {{ width: 100%; border-radius: 10px; display: block; }}
 video {{ width: 100%; border-radius: 10px; display: block; margin-top: 10px; background: #000; }}
 p {{ margin: 8px 0 0; word-break: break-word; }}
-button {{ background: #dc2626; color: white; border: 0; border-radius: 8px; padding: 10px 14px; cursor: pointer; }}
 {self._render_shared_styles()}
 </style></head>
 <body>
@@ -3593,42 +3672,92 @@ button {{ background: #dc2626; color: white; border: 0; border-radius: 8px; padd
 {self._render_nav("images")}
 <h1>Captured images</h1>
 <p>Keeping only the newest {self.config.max_saved_images} images.</p>
+{summary}
 {pagination}
 <div class="grid">{gallery}</div>
 {pagination}
 </div>
 </body></html>"""
 
-    def _render_videos_page(self, page: int = 1) -> str:
+    def _render_videos_page(self, page: int = 1, selected_relative: str = "") -> str:
         videos = self._list_saved_videos()
         total_videos = len(videos)
         total_pages = max(1, (total_videos + GALLERY_PAGE_SIZE - 1) // GALLERY_PAGE_SIZE)
         page = min(max(1, page), total_pages)
         start = (page - 1) * GALLERY_PAGE_SIZE
-        gallery = self._render_video_cards(videos[start : start + GALLERY_PAGE_SIZE])
-        pagination = self._pagination_html("/videos", page, total_videos, GALLERY_PAGE_SIZE)
+        page_videos = videos[start : start + GALLERY_PAGE_SIZE]
+        selected_video = None
+        if page_videos:
+            if selected_relative:
+                selected_video = next(
+                    (video_path for video_path in page_videos if self._relative_video_path(video_path) == selected_relative),
+                    None,
+                )
+            if selected_video is None:
+                selected_video = page_videos[0]
+        gallery = self._render_video_cards(page_videos, selected_video, page)
+        pagination = self._pagination_html(
+            "/videos",
+            page,
+            total_videos,
+            GALLERY_PAGE_SIZE,
+            extra_params={"selected": selected_relative} if selected_relative else None,
+        )
+        summary = self._gallery_summary_html(page, total_videos, GALLERY_PAGE_SIZE, "videos")
         return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Saved Videos</title>
 <style>
 body {{ font-family: Arial, sans-serif; background: #020617; color: #e2e8f0; margin: 0; padding: 24px; }}
 a {{ color: #93c5fd; }}
-.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 18px; }}
-.card {{ background: #111827; padding: 12px; border-radius: 14px; }}
+.stack {{ display: grid; gap: 18px; }}
+.player-card, .card {{ background: #111827; padding: 14px; border-radius: 14px; }}
+.video-list {{ display: grid; gap: 10px; }}
+.video-row {{ display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid #1f2937; }}
+.video-row.active {{ color: #f8fafc; }}
+.video-meta {{ min-width: 0; flex: 1; }}
+.video-meta p {{ margin: 4px 0 0; color: #94a3b8; font-size: 0.92rem; }}
+.video-actions {{ display: flex; flex-wrap: wrap; gap: 10px; }}
+.video-actions a {{ text-decoration: none; }}
+.video-icon-form {{ margin: 0; }}
+.video-icon-button {{ display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 999px; border: 1px solid #334155; background: transparent; color: #cbd5e1; cursor: pointer; padding: 0; }}
+.video-icon-button svg {{ width: 18px; height: 18px; fill: currentColor; display: block; }}
+.video-icon-button:hover {{ border-color: #facc15; color: #facc15; background: #172033; }}
+.video-icon-button.danger:hover {{ border-color: #f87171; color: #f87171; background: #2b1520; }}
+.player-card {{ max-width: 820px; }}
+.player-wrap {{ position: relative; width: 100%; max-width: 820px; }}
+.player-wrap video {{ width: 100%; max-height: 460px; border-radius: 10px; display: block; background: #000; }}
+.player-overlay-button {{ position: absolute; top: 10px; right: 10px; width: 38px; height: 38px; border-radius: 999px; border: 0; background: rgba(2, 6, 23, 0.72); color: #f8fafc; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }}
+.player-overlay-button svg {{ width: 20px; height: 20px; fill: currentColor; display: block; }}
+.player-overlay-button:hover {{ background: rgba(15, 23, 42, 0.92); }}
+.action-overlay {{ position: fixed; inset: 0; background: rgba(2, 6, 23, 0.72); display: none; align-items: center; justify-content: center; z-index: 1000; padding: 24px; }}
+.action-overlay.visible {{ display: flex; }}
+.action-overlay-card {{ min-width: min(92vw, 360px); max-width: 420px; background: #111827; border: 1px solid #334155; border-radius: 18px; padding: 22px; text-align: center; box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35); }}
+.action-overlay-card p {{ margin: 10px 0 0; color: #cbd5e1; }}
+.action-spinner {{ width: 34px; height: 34px; margin: 0 auto; border-radius: 999px; border: 3px solid #334155; border-top-color: #facc15; animation: spin 0.9s linear infinite; }}
+.action-overlay-close {{ margin-top: 14px; background: #facc15; color: #111827; border: 0; border-radius: 8px; padding: 9px 14px; cursor: pointer; font-weight: 700; display: none; }}
+@keyframes spin {{ to {{ transform: rotate(360deg); }} }}
 .pagination {{ display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 18px 0; }}
 .pagination a, .pagination span {{ border: 1px solid #334155; border-radius: 8px; padding: 8px 12px; text-decoration: none; }}
 .pagination span {{ color: #94a3b8; }}
-video {{ width: 100%; border-radius: 10px; display: block; background: #000; }}
 p {{ margin: 8px 0 0; word-break: break-word; }}
-button {{ background: #dc2626; color: white; border: 0; border-radius: 8px; padding: 10px 14px; cursor: pointer; }}
 {self._render_shared_styles()}
 </style></head>
 <body>
 <div class="page-shell">
 {self._render_nav("videos")}
 <h1>Saved videos</h1>
+{summary}
 {pagination}
-<div class="grid">{gallery}</div>
+<div class="stack">{gallery}</div>
 {pagination}
+</div>
+<div id="action-overlay" class="action-overlay" aria-live="polite" aria-busy="true">
+  <div class="action-overlay-card">
+    <div id="action-spinner" class="action-spinner"></div>
+    <h2 id="action-title">Working...</h2>
+    <p id="action-message">Please wait while the action finishes.</p>
+    <button id="action-close" class="action-overlay-close" type="button">Close</button>
+  </div>
 </div>
 </body></html>"""
 
@@ -4287,6 +4416,24 @@ a {{ color: #93c5fd; }}
             raise ValueError("Video file was not found")
         return target
 
+    def _read_simple_form_value(self, handler: BaseHTTPRequestHandler, key: str) -> str:
+        content_length = int(handler.headers.get("Content-Length", "0") or "0")
+        raw_body = handler.rfile.read(content_length)
+        if handler.headers.get("Content-Type", "").startswith("application/json"):
+            payload = json.loads(raw_body or b"{}")
+            return str(payload.get(key) or "")
+        payload = parse_qs(raw_body.decode("utf-8", errors="replace"))
+        return str((payload.get(key) or [""])[0])
+
+    def _read_simple_form(self, handler: BaseHTTPRequestHandler) -> dict[str, str]:
+        content_length = int(handler.headers.get("Content-Length", "0") or "0")
+        raw_body = handler.rfile.read(content_length)
+        if handler.headers.get("Content-Type", "").startswith("application/json"):
+            payload = json.loads(raw_body or b"{}")
+            return {str(key): "" if value is None else str(value) for key, value in payload.items()}
+        payload = parse_qs(raw_body.decode("utf-8", errors="replace"))
+        return {str(key): str(values[0]) for key, values in payload.items() if values}
+
     def _handle_video_snapshot_fast_alpr(self, handler: BaseHTTPRequestHandler) -> None:
         try:
             if not self.config.fast_alpr_url:
@@ -4338,6 +4485,149 @@ a {{ color: #93c5fd; }}
                     indent=2,
                 )
             )
+            result = self._recognize_fast_alpr(image_bytes)
+            result_path = image_path.with_name(f"{image_path.stem}.manual_fast_alpr.json")
+            result_path.write_text(json.dumps(result, indent=2))
+            relative = self._relative_image_path(image_path)
+            body = self._render_saved_image_fast_alpr_result_page(relative, result, result_path).encode("utf-8")
+            handler.send_response(HTTPStatus.OK)
+            handler.send_header("Content-Type", "text/html; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+        except Exception as exc:
+            body = self._render_saved_image_fast_alpr_error_page(str(exc)).encode("utf-8")
+            handler.send_response(HTTPStatus.BAD_REQUEST)
+            handler.send_header("Content-Type", "text/html; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+
+    def _video_capture_duration_seconds(self, capture) -> float:
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+        if fps > 0 and frame_count > 0:
+            return max(0.0, frame_count / fps)
+        return 0.0
+
+    def _extract_saved_video_candidates(
+        self,
+        video_path: Path,
+        limit: int,
+    ) -> List[CandidateFrame]:
+        capture = cv2.VideoCapture(str(video_path))
+        if not capture.isOpened():
+            raise ValueError(f"Could not open {video_path.name}")
+        try:
+            duration_seconds = self._video_capture_duration_seconds(capture)
+            if duration_seconds <= 0:
+                target_seconds = [0.0]
+            else:
+                target_seconds = self._video_extraction_timestamps(0.0, duration_seconds, limit)
+            candidates: List[CandidateFrame] = []
+            for position_seconds in target_seconds:
+                capture.set(cv2.CAP_PROP_POS_MSEC, max(0.0, position_seconds) * 1000.0)
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    continue
+                candidates.append(
+                    CandidateFrame(
+                        frame=frame.copy(),
+                        timestamp=position_seconds,
+                        motion_area=0,
+                        sharpness=self._compute_sharpness(self._plate_crop(frame)),
+                        jpeg_bytes=self._encode_jpeg(frame),
+                        source="video",
+                    )
+                )
+            return candidates
+        finally:
+            capture.release()
+
+    def _handle_video_extract_images(self, handler: BaseHTTPRequestHandler) -> None:
+        try:
+            form = self._read_simple_form(handler)
+            relative_path = str(form.get("path") or "")
+            video_path = self._saved_video_path_from_relative(relative_path)
+            candidates = self._extract_saved_video_candidates(video_path, max(1, min(self.config.upload_top_frames, 48)))
+            if not candidates:
+                raise ValueError("No images could be extracted from that video")
+            stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            event_name = f"{self.config.camera_name}_video_extract_{stamp}"
+            event_dir = self.config.image_output_dir / event_name
+            event_dir.mkdir(parents=True, exist_ok=True)
+            saved_paths: List[Path] = []
+            for index, candidate in enumerate(candidates, start=1):
+                pipeline = self._run_detection_pipeline(
+                    candidate.frame,
+                    event_dir,
+                    f"frame_{index:02d}",
+                    event_name,
+                    time.time(),
+                    enable_alpr=False,
+                    jpeg_bytes=candidate.jpeg_bytes,
+                )
+                saved_paths.append(pipeline["frame_path"])
+            summary = {
+                "camera_name": self.config.camera_name,
+                "started_at_epoch": time.time(),
+                "ended_at_epoch": time.time(),
+                "trigger_count": 0,
+                "saved_frames": len(saved_paths),
+                "clip_path": self._relative_video_path(video_path),
+                "video_extract": True,
+                "image_source": "video",
+                "event_policy": "images-only",
+                "zone_images": [],
+                "fast_alpr_results_count": 0,
+                "openalpr_results_count": 0,
+                "plates": [],
+            }
+            (event_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+            self._prune_saved_images()
+            handler.send_response(HTTPStatus.SEE_OTHER)
+            handler.send_header("Location", "/images")
+            handler.end_headers()
+        except Exception as exc:
+            body = json.dumps({"error": str(exc)}).encode("utf-8")
+            handler.send_response(HTTPStatus.BAD_REQUEST)
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+
+    def _handle_video_quick_alpr(self, handler: BaseHTTPRequestHandler) -> None:
+        try:
+            if not self.config.fast_alpr_url:
+                raise ValueError("FAST_ALPR_URL is not configured")
+            relative_path = self._read_simple_form_value(handler, "path")
+            video_path = self._saved_video_path_from_relative(relative_path)
+            candidates = self._extract_saved_video_candidates(video_path, 1)
+            if not candidates:
+                raise ValueError("No video frame could be extracted for ALPR")
+            candidate = candidates[0]
+            stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            event_name = f"{self.config.camera_name}_video_snapshot_{stamp}"
+            event_dir = self.config.image_output_dir / event_name
+            event_dir.mkdir(parents=True, exist_ok=True)
+            image_path = event_dir / "video_snapshot.jpg"
+            image_path.write_bytes(candidate.jpeg_bytes or self._encode_jpeg(candidate.frame))
+            (event_dir / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "camera_name": self.config.camera_name,
+                        "started_at_epoch": time.time(),
+                        "ended_at_epoch": time.time(),
+                        "trigger_count": 0,
+                        "saved_frames": 1,
+                        "clip_path": self._relative_video_path(video_path),
+                        "video_snapshot": True,
+                        "video_position_seconds": candidate.timestamp,
+                    },
+                    indent=2,
+                )
+            )
+            image_bytes = image_path.read_bytes()
             result = self._recognize_fast_alpr(image_bytes)
             result_path = image_path.with_name(f"{image_path.stem}.manual_fast_alpr.json")
             result_path.write_text(json.dumps(result, indent=2))
@@ -4449,6 +4739,12 @@ a {{ color: #93c5fd; }}
 
     def _render_image_cards(self, images: List[Path]) -> str:
         cards = []
+        car_icon = (
+            '<svg viewBox="0 0 24 24" aria-hidden="true">'
+            '<path d="M5.5 16a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Zm13 0a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Z"/>'
+            '<path d="M5 14h14l-1.2-4.1a2 2 0 0 0-1.92-1.43H8.12A2 2 0 0 0 6.2 9.9L5 14Zm15 1a1 1 0 0 1 1 1v3h-2v-1H5v1H3v-3a1 1 0 0 1 1-1h16ZM7.12 9.34A3 3 0 0 1 10 7h5a3 3 0 0 1 2.88 2.34L19.78 16H4.22l2.9-6.66Z"/>'
+            '</svg>'
+        )
         for image_path in images:
             relative = self._relative_image_path(image_path)
             detail_link = self._image_detail_url(relative)
@@ -4468,10 +4764,11 @@ a {{ color: #93c5fd; }}
             escaped_relative_attr = html.escape(relative, quote=True)
             cards.append(
                 f'<div class="card"><a href="{detail_link}"><img src="{image_url}" alt="{escaped_relative}"></a>'
-                f'<p><a href="{detail_link}">{escaped_name}</a></p><p>{stamp}</p>{policy_note}'
-                f'<form method="post" action="/api/images/alpr" style="margin-top:10px;">'
+                f'<div class="card-actions"><p class="card-filename"><a href="{detail_link}">{escaped_name}</a></p>'
+                f'<form method="post" action="/api/images/alpr" class="card-icon-form">'
                 f'<input type="hidden" name="path" value="{escaped_relative_attr}">'
-                f'<button type="submit">Send to ALPR</button></form></div>'
+                f'<button type="submit" class="card-icon-button" aria-label="Send image to ALPR" title="Send image to ALPR">{car_icon}</button></form></div>'
+                f'<p>{stamp}</p>{policy_note}</div>'
             )
         return "".join(cards) or "<p>No images saved yet.</p>"
 
@@ -4566,11 +4863,39 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
             reverse=True,
         )
 
-    def _render_video_cards(self, videos: List[Path]) -> str:
-        cards = []
+    def _render_video_cards(
+        self,
+        videos: List[Path],
+        selected_video: Optional[Path] = None,
+        page: int = 1,
+    ) -> str:
+        if not videos:
+            return "<p>No videos saved yet.</p>"
+        play_icon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>'
+        image_icon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 19V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2ZM8.5 8.5A1.5 1.5 0 1 1 7 7a1.5 1.5 0 0 1 1.5 1.5ZM5 19l4.5-6 3.5 4.5 2.5-3 3.5 4.5H5Z"/></svg>'
+        car_icon = (
+            '<svg viewBox="0 0 24 24" aria-hidden="true">'
+            '<path d="M5.5 16a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Zm13 0a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Z"/>'
+            '<path d="M5 14h14l-1.2-4.1a2 2 0 0 0-1.92-1.43H8.12A2 2 0 0 0 6.2 9.9L5 14Zm15 1a1 1 0 0 1 1 1v3h-2v-1H5v1H3v-3a1 1 0 0 1 1-1h16ZM7.12 9.34A3 3 0 0 1 10 7h5a3 3 0 0 1 2.88 2.34L19.78 16H4.22l2.9-6.66Z"/>'
+            '</svg>'
+        )
+        remove_icon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6l1 2h5v2H3V5h5l1-2Zm1 6h2v8h-2V9Zm4 0h2v8h-2V9ZM6 9h2v8H6V9Zm1 12a2 2 0 0 1-2-2V8h14v11a2 2 0 0 1-2 2H7Z"/></svg>'
+        fullscreen_icon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h5v2H7v3H5V5Zm12 0h2v5h-2V7h-3V5h3ZM5 14h2v3h3v2H5v-5Zm12 3v-3h2v5h-5v-2h3Z"/></svg>'
+        selected_relative = self._relative_video_path(selected_video) if selected_video else ""
+        selected_player_html = "<p>Select a video from the list below.</p>"
+        if selected_video is not None:
+            selected_video_url = self._event_file_url(selected_relative)
+            selected_player_html = (
+                f'<div class="player-card"><h2>Player</h2>'
+                f'<div class="player-wrap"><video id="gallery-video-player" controls preload="metadata" src="{selected_video_url}"></video>'
+                f'<button id="gallery-video-fullscreen" class="player-overlay-button" type="button" aria-label="Fullscreen" title="Fullscreen">{fullscreen_icon}</button></div>'
+                f'<p>{html.escape(selected_relative)}</p>'
+                f'<p><a href="{self._video_detail_url(selected_relative)}">Open detail view</a> | '
+                f'<a href="{selected_video_url}">Open video file</a></p></div>'
+            )
+        rows = []
         for video_path in videos:
             relative = self._relative_video_path(video_path)
-            video_url = self._event_file_url(relative)
             detail_url = self._video_detail_url(relative)
             metadata_path = video_path.with_suffix(".json")
             zone_text = "unknown"
@@ -4586,12 +4911,113 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
                 except Exception:
                     pass
             escaped_relative = html.escape(relative)
-            cards.append(
-                f'<div class="card"><p><a href="{detail_url}">{escaped_relative}</a></p>'
-                f'<p>{started_text}</p><p>Zones: {html.escape(zone_text)}</p>'
-                f'<video controls preload="metadata" src="{video_url}"></video></div>'
+            item_class = "video-row active" if relative == selected_relative else "video-row"
+            select_link = f'/videos?{urlencode({"page": str(page), "selected": relative})}'
+            rows.append(
+                f'<div class="{item_class}"><div class="video-meta"><p><strong>{escaped_relative}</strong></p>'
+                f'<p>{started_text} | Zones: {html.escape(zone_text)}</p></div>'
+                f'<div class="video-actions">'
+                f'<a class="video-icon-button" href="{select_link}" aria-label="Play video" title="Play video">{play_icon}</a>'
+                f'<form method="post" action="/api/videos/extract-images" class="video-icon-form" data-action-label="Extracting images" data-action-detail="{escaped_relative}">'
+                f'<input type="hidden" name="path" value="{html.escape(relative, quote=True)}">'
+                f'<button type="submit" class="video-icon-button" aria-label="Extract images" title="Extract images">{image_icon}</button></form>'
+                f'<form method="post" action="/api/videos/quick-alpr" class="video-icon-form" data-action-label="Sending frame to ALPR" data-action-detail="{escaped_relative}">'
+                f'<input type="hidden" name="path" value="{html.escape(relative, quote=True)}">'
+                f'<button type="submit" class="video-icon-button" aria-label="Send video frame to ALPR" title="Send video frame to ALPR">{car_icon}</button></form>'
+                f'<form method="post" action="/api/videos/delete" class="video-icon-form" data-action-label="Removing video" data-action-detail="{escaped_relative}" onsubmit="return confirm(\'Remove this video?\');">'
+                f'<input type="hidden" name="path" value="{html.escape(relative, quote=True)}">'
+                f'<input type="hidden" name="page" value="{page}">'
+                f'<button type="submit" class="video-icon-button danger" aria-label="Remove video" title="Remove video">{remove_icon}</button></form>'
+                f'</div></div>'
             )
-        return "".join(cards) or "<p>No videos saved yet.</p>"
+        player_script = """<script>
+(() => {
+  const button = document.getElementById('gallery-video-fullscreen');
+  const video = document.getElementById('gallery-video-player');
+  if (button && video) {
+    button.addEventListener('click', async () => {
+      const target = video.parentElement || video;
+      try {
+        if (document.fullscreenElement) {
+          await document.exitFullscreen();
+        } else if (target.requestFullscreen) {
+          await target.requestFullscreen();
+        }
+      } catch (error) {
+        console.warn('Fullscreen failed', error);
+      }
+    });
+  }
+
+  const overlay = document.getElementById('action-overlay');
+  const title = document.getElementById('action-title');
+  const message = document.getElementById('action-message');
+  const spinner = document.getElementById('action-spinner');
+  const close = document.getElementById('action-close');
+  const forms = Array.from(document.querySelectorAll('.video-icon-form'));
+  if (!overlay || !title || !message || !spinner || !close || !forms.length) return;
+
+  function setOverlayState(heading, detail, finished = false) {
+    title.textContent = heading;
+    message.textContent = detail;
+    overlay.classList.add('visible');
+    spinner.style.display = finished ? 'none' : 'block';
+    close.style.display = finished ? 'inline-flex' : 'none';
+  }
+
+  function hideOverlay() {
+    overlay.classList.remove('visible');
+    spinner.style.display = 'block';
+    close.style.display = 'none';
+  }
+
+  close.addEventListener('click', hideOverlay);
+
+  forms.forEach((form) => {
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const submitter = form.querySelector('button');
+      const label = form.dataset.actionLabel || 'Working';
+      const detail = form.dataset.actionDetail || 'Please wait while the request completes.';
+      if (submitter) submitter.disabled = true;
+      setOverlayState(label + '...', detail);
+      try {
+        const response = await fetch(form.action, {
+          method: 'POST',
+          body: new FormData(form),
+        });
+        const contentType = response.headers.get('content-type') || '';
+        if (response.redirected) {
+          window.location.href = response.url;
+          return;
+        }
+        if (contentType.includes('text/html')) {
+          const text = await response.text();
+          document.open();
+          document.write(text);
+          document.close();
+          return;
+        }
+        if (contentType.includes('application/json')) {
+          const payload = await response.json();
+          if (!response.ok) throw new Error(payload.error || 'Action failed');
+          setOverlayState('Finished', payload.message || 'The action completed successfully.', true);
+          return;
+        }
+        if (!response.ok) {
+          throw new Error('Action failed');
+        }
+        setOverlayState('Finished', 'The action completed successfully.', true);
+      } catch (error) {
+        setOverlayState('Action failed', error.message || 'The request did not finish successfully.', true);
+      } finally {
+        if (submitter) submitter.disabled = false;
+      }
+    }
+  });
+})();
+</script>"""
+        return selected_player_html + f'<div class="card"><h2>Files On This Page</h2><div class="video-list">{"".join(rows)}</div></div>' + player_script
 
     def _serve_video_detail_page(self, handler: BaseHTTPRequestHandler, relative_path: str) -> None:
         try:
@@ -4755,6 +5181,26 @@ video {{ width: 100%; border-radius: 10px; display: block; background: #000; }}
             handler.end_headers()
             handler.wfile.write(body)
 
+    def _handle_delete_video(self, handler: BaseHTTPRequestHandler) -> None:
+        try:
+            form = self._read_simple_form(handler)
+            relative_path = str(form.get("path") or "")
+            page = max(1, int(form.get("page") or "1"))
+            video_path = self._saved_video_path_from_relative(relative_path)
+            metadata_path = video_path.with_suffix(".json")
+            video_path.unlink(missing_ok=True)
+            metadata_path.unlink(missing_ok=True)
+            handler.send_response(HTTPStatus.SEE_OTHER)
+            handler.send_header("Location", f"/videos?page={page}")
+            handler.end_headers()
+        except Exception as exc:
+            body = json.dumps({"error": str(exc)}).encode("utf-8")
+            handler.send_response(HTTPStatus.BAD_REQUEST)
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+
     def _handle_clear_plates(self, handler: BaseHTTPRequestHandler) -> None:
         try:
             cleared = 0
@@ -4859,11 +5305,18 @@ video {{ width: 100%; border-radius: 10px; display: block; background: #000; }}
 
 
 def main() -> None:
+    config = Config.from_env()
+    log_dir = Path(os.getenv("LOG_OUTPUT_DIR", str(config.event_output_dir.parent / "logs"))).expanduser()
+    log_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(log_dir / "watcher.log"),
+        ],
+        force=True,
     )
-    config = Config.from_env()
     watcher = RtspVehicleWatcher(config)
     watcher.run()
 
