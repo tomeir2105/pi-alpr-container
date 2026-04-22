@@ -1,0 +1,5 @@
+fast-alpr
+onnxruntime
+fastapi
+uvicorn[standard]
+python-multipart

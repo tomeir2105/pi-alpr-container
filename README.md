@@ -1,6 +1,6 @@
 # RTSP to OpenALPR Watcher
 
-This project pulls an RTSP stream from your home camera, detects passing motion locally, samples event frames across the full motion timeline, optionally checks frames with a local `fast-alpr` container, and uploads qualifying frames to Rekor/OpenALPR for cloud recognition.
+This project pulls an RTSP stream from your home camera, detects passing motion locally, samples event frames across the full motion timeline, optionally checks frames with a remote or local `fast-alpr` HTTP service, and uploads qualifying frames to Rekor/OpenALPR for cloud recognition.
 
 It also exposes a local dashboard UI:
 
@@ -16,7 +16,7 @@ Persistent data is stored under:
 
 - `/mnt/localdisk/pi-alpr/events/images`
 - `/mnt/localdisk/pi-alpr/events/videos`
-- `/mnt/localdisk/pi-alpr/fast-alpr-cache`
+- `/mnt/localdisk/pi-alpr/fast-alpr-cache` on the Pi that runs `fast-alpr`
 
 ## How it works
 
@@ -24,7 +24,7 @@ Persistent data is stored under:
 2. It watches a configurable road region of interest (ROI).
 3. When motion in that ROI looks vehicle-sized for several consecutive checks, it starts an event.
 4. It keeps a short pre-roll and post-roll buffer so the saved clip includes the full pass.
-5. If configured, it sends event frames to a local `fast-alpr` container first.
+5. If configured, it sends event frames to a `fast-alpr` service first.
 6. It uploads qualifying frames to the OpenALPR cloud API.
 7. It stores the clip, uploaded frames, API responses, and a summary on disk.
 
@@ -33,8 +33,9 @@ Persistent data is stored under:
 - `alpr_watcher.py`: main watcher service
 - `.env.example`: environment variables to copy into `.env`
 - `requirements.txt`: Python dependencies
-- `docker-compose.yml`: full watcher + `fast-alpr` stack
-- `third_party/fast-alpr-container/`: tracked container app for `fast-alpr`
+- `docker-compose.yml`: watcher-only stack
+- `deploy/fast-alpr/`: standalone `fast-alpr` deployment for another Pi
+- `third_party/fast-alpr-container/`: original tracked container app for `fast-alpr`
 - `events/`: created at runtime for clips, frames, and JSON results
 
 ## Setup
@@ -42,7 +43,6 @@ Persistent data is stored under:
 ```bash
 mkdir -p /mnt/localdisk/pi-alpr/events/images
 mkdir -p /mnt/localdisk/pi-alpr/events/videos
-mkdir -p /mnt/localdisk/pi-alpr/fast-alpr-cache
 mkdir -p /mnt/localdisk/pi-alpr/config
 cp .env.example /mnt/localdisk/pi-alpr/config/.env
 ```
@@ -67,13 +67,30 @@ If you want local filtering before OpenALPR, also set:
 
 - `FAST_ALPR_URL`
 
+Example for a second Pi:
+
+```dotenv
+FAST_ALPR_URL=http://192.168.1.50:8090
+```
+
 For the built-in web UI, you can also set:
 
 - `WEB_PORT`
 
 ## Run
 
+Watcher on the main Pi:
+
 ```bash
+docker compose up -d --build watcher
+```
+
+Standalone `fast-alpr` on the second Pi:
+
+```bash
+cd deploy/fast-alpr
+cp .env.example .env
+mkdir -p /mnt/localdisk/pi-alpr/fast-alpr-cache
 docker compose up -d --build
 ```
 
@@ -113,7 +130,7 @@ When the watcher is running, open:
 - `EVENT_MAX_SECONDS` forces an event to close even if motion detection keeps reporting movement.
 - `UPLOAD_TOP_FRAMES` controls how many images are sampled across the event/video timeline; the default keeps 240 images per kept event.
 - `UPLOAD_MIN_SHARPNESS` skips blurry frames when possible.
-- `FAST_ALPR_URL` enables local plate recognition before cloud upload.
+- `FAST_ALPR_URL` enables plate recognition before cloud upload and can point to another Pi.
 - `FAST_ALPR_MIN_CONFIDENCE` is the minimum local OCR confidence required before a frame is sent to OpenALPR.
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `TELEGRAM_ALERT_IMAGES` configure Telegram photo alerts for movement events.
 - `TELEGRAM_ALERTS_ENABLED` sets the startup default for per-zone Telegram alerts; the dashboard zone checkboxes can turn alerts on or off at runtime.
@@ -165,7 +182,7 @@ PREBUFFER_FRAMES=0
 POSTBUFFER_FRAMES=0
 UPLOAD_TOP_FRAMES=240
 UPLOAD_MIN_SHARPNESS=80.0
-FAST_ALPR_URL=http://fast-alpr:8090
+FAST_ALPR_URL=http://192.168.1.50:8090
 FAST_ALPR_MIN_CONFIDENCE=0.75
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
