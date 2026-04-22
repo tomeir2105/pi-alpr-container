@@ -1,4 +1,3 @@
-import cgi
 import html
 import json
 import logging
@@ -18,7 +17,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlencode
-from typing import Any, Deque, List, Optional, Tuple
+from typing import Any, Deque, List, Optional, Set, Tuple
+from email.parser import BytesParser
+from email.policy import default as email_policy
 
 import cv2
 import numpy as np
@@ -35,6 +36,8 @@ VIDEO_WRITER_QUEUE_SECONDS = 8.0
 DEFAULT_RTSP_CAPTURE_OPTIONS = "rtsp_transport;tcp|max_delay;2000000|stimeout;10000000"
 DEFAULT_ALPR_CAPTURE_FPS = 1.0
 GALLERY_PAGE_SIZE = 24
+MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024
+FILE_STREAM_CHUNK_SIZE = 1024 * 1024
 
 
 def parse_bool(value: str, default: bool = False) -> bool:
@@ -53,6 +56,12 @@ def parse_normalized_roi(value: str, env_name: str) -> Optional[Tuple[float, flo
     if not (0.0 <= x1 < x2 <= 1.0 and 0.0 <= y1 < y2 <= 1.0):
         raise ValueError(f"{env_name} values must satisfy 0.0 <= x1 < x2 <= 1.0 and 0.0 <= y1 < y2 <= 1.0")
     return (x1, y1, x2, y2)
+
+
+def redact_url_credentials(value: str) -> str:
+    if not value:
+        return value
+    return re.sub(r"(?<=://)([^/@:]+)(?::[^/@]*)?@", "***:***@", value)
 
 
 @dataclass
@@ -107,10 +116,6 @@ class Config:
     def telegram_configured(self) -> bool:
         return bool(self.telegram_bot_token and self.telegram_chat_id and self.telegram_alert_images > 0)
 
-    @property
-    def telegram_enabled(self) -> bool:
-        return self.telegram_configured
-
     @classmethod
     def from_env(cls) -> "Config":
         load_dotenv()
@@ -127,8 +132,11 @@ class Config:
         if not rtsp_url:
             raise ValueError("RTSP_URL is required")
 
-        roi = parse_normalized_roi(getenv("ROI").strip(), "ROI")
-        plate_roi = parse_normalized_roi(getenv("PLATE_ROI").strip(), "PLATE_ROI")
+        try:
+            roi = parse_normalized_roi(getenv("ROI").strip(), "ROI")
+            plate_roi = parse_normalized_roi(getenv("PLATE_ROI").strip(), "PLATE_ROI")
+        except ValueError as exc:
+            raise ValueError(f"Invalid ROI configuration: {exc}") from exc
 
         event_output_dir = Path(getenv("EVENT_OUTPUT_DIR", "./events")).expanduser()
         image_output_dir = Path(getenv("IMAGE_OUTPUT_DIR", str(event_output_dir))).expanduser()
@@ -188,7 +196,7 @@ class CandidateFrame:
     sharpness: float
     jpeg_bytes: Optional[bytes] = None
     source: str = "capture"
-    zone_ids: set[str] = field(default_factory=set)
+    zone_ids: Set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -199,6 +207,9 @@ class MotionZone:
     enabled: bool
     use_fast_alpr: bool
     send_telegram: bool
+    record_seconds: float
+    image_count: int
+    coverage_trigger_percent: float
     color_hex: str
     fill_rgba: str
     overlay_bgr: Tuple[int, int, int]
@@ -213,7 +224,7 @@ class Event:
     last_motion_at: float
     last_frame_at: float
     frames_since_motion: int
-    zones_triggered: set[str]
+    zones_triggered: Set[str]
 
 
 @dataclass
@@ -240,7 +251,8 @@ class VideoRecording:
     started_at: float
     first_frame_at: float
     ends_at: float
-    started_from_zone_ids: set[str]
+    record_seconds: float
+    started_from_zone_ids: Set[str]
     output_path: Path
     temp_output_path: Path
     writer: Any
@@ -385,17 +397,18 @@ class QueuedVideoWriter:
             if self.closed:
                 raise RuntimeError(f"video writer is closed for {self.output_path}")
         frame_copy = frame.copy()
-        try:
-            self.queue.put_nowait(frame_copy)
-        except queue.Full:
+        while True:
             try:
-                self.queue.get_nowait()
-                self.queue.task_done()
-            except queue.Empty:
-                pass
-            with self.lock:
-                self.dropped_frames += 1
-            self.queue.put_nowait(frame_copy)
+                self.queue.put_nowait(frame_copy)
+                return
+            except queue.Full:
+                try:
+                    self.queue.get_nowait()
+                    self.queue.task_done()
+                except queue.Empty:
+                    pass
+                with self.lock:
+                    self.dropped_frames += 1
 
     def release(self) -> None:
         with self.lock:
@@ -479,8 +492,10 @@ class RtspVehicleWatcher:
         self.motion_streak = 0
         self.last_motion_area = 0
         self.last_motion_box: Optional[Tuple[int, int, int, int]] = None
-        self.last_triggered_zone_ids: set[str] = set()
+        self.last_triggered_zone_ids: Set[str] = set()
         self.last_zone_area_by_id: dict[str, int] = {}
+        self.last_zone_coverage_percent_by_id: dict[str, float] = {}
+        self.last_coverage_triggered_zone_ids: Set[str] = set()
         self.latest_motion_status = "Motion zones: waiting for activity"
         self.video_recording: Optional[VideoRecording] = None
         self.alpr_capture_session: Optional[AlprCaptureSession] = None
@@ -538,6 +553,9 @@ class RtspVehicleWatcher:
                 enabled=True,
                 use_fast_alpr=True,
                 send_telegram=self.config.telegram_alerts_enabled,
+                record_seconds=max(1.0, VIDEO_RECORDING_SECONDS),
+                image_count=max(1, self.config.upload_top_frames),
+                coverage_trigger_percent=50.0,
                 color_hex="#facc15",
                 fill_rgba="rgba(250,204,21,0.14)",
                 overlay_bgr=(0, 200, 255),
@@ -549,6 +567,9 @@ class RtspVehicleWatcher:
                 enabled=False,
                 use_fast_alpr=False,
                 send_telegram=self.config.telegram_alerts_enabled,
+                record_seconds=max(1.0, VIDEO_RECORDING_SECONDS),
+                image_count=max(1, self.config.upload_top_frames),
+                coverage_trigger_percent=50.0,
                 color_hex="#c084fc",
                 fill_rgba="rgba(192,132,252,0.16)",
                 overlay_bgr=(250, 120, 170),
@@ -565,6 +586,19 @@ class RtspVehicleWatcher:
         primary_zone = self._find_motion_zone("yellow")
         if primary_zone:
             self.config.roi = primary_zone.roi
+
+    def _zones_for_policy(self, zone_ids: Set[str]) -> List[MotionZone]:
+        zones = [zone for zone in self.motion_zones if zone.zone_id in zone_ids]
+        if zones:
+            return zones
+        primary_zone = self._find_motion_zone("yellow")
+        return [primary_zone] if primary_zone else []
+
+    def _record_seconds_for_zone_ids(self, zone_ids: Set[str]) -> float:
+        return max((zone.record_seconds for zone in self._zones_for_policy(zone_ids)), default=max(1.0, VIDEO_RECORDING_SECONDS))
+
+    def _image_limit_for_zone_ids(self, zone_ids: Set[str]) -> int:
+        return max((zone.image_count for zone in self._zones_for_policy(zone_ids)), default=max(1, self.config.upload_top_frames))
 
     def _load_runtime_config(self) -> None:
         try:
@@ -604,6 +638,12 @@ class RtspVehicleWatcher:
                         zone.send_telegram = parse_bool(send_telegram_value, default=zone.send_telegram)
                     else:
                         zone.send_telegram = bool(send_telegram_value)
+                    zone.record_seconds = max(1.0, float(zone_payload.get("record_seconds", zone.record_seconds)))
+                    zone.image_count = max(1, int(zone_payload.get("image_count", zone.image_count)))
+                    zone.coverage_trigger_percent = min(
+                        100.0,
+                        max(0.0, float(zone_payload.get("coverage_trigger_percent", zone.coverage_trigger_percent))),
+                    )
             roi_value = payload.get("roi")
             if isinstance(roi_value, str):
                 primary_zone = self._find_motion_zone("yellow")
@@ -639,6 +679,9 @@ class RtspVehicleWatcher:
                             "enabled": zone.enabled,
                             "use_fast_alpr": zone.use_fast_alpr,
                             "send_telegram": zone.send_telegram,
+                            "record_seconds": zone.record_seconds,
+                            "image_count": zone.image_count,
+                            "coverage_trigger_percent": zone.coverage_trigger_percent,
                         }
                         for zone in self.motion_zones
                     ],
@@ -686,8 +729,18 @@ class RtspVehicleWatcher:
         )
 
         capture_stop = threading.Event()
-        capture_error: list[Exception] = []
+        capture_error: queue.Queue[Exception] = queue.Queue(maxsize=1)
+        capture_failure: List[Optional[Exception]] = [None]
         frame_queue: queue.Queue[Tuple[float, Any]] = queue.Queue(maxsize=1)
+
+        def current_capture_error() -> Optional[Exception]:
+            if capture_failure[0] is not None:
+                return capture_failure[0]
+            try:
+                capture_failure[0] = capture_error.get_nowait()
+            except queue.Empty:
+                return None
+            return capture_failure[0]
 
         def replace_captured_frame(payload: Tuple[float, Any]) -> None:
             try:
@@ -717,21 +770,24 @@ class RtspVehicleWatcher:
                     self._record_capture_frame(timestamp)
                     replace_captured_frame((timestamp, self._resize_frame(captured_frame)))
             except Exception as exc:
-                capture_error.append(exc)
+                if capture_error.empty():
+                    capture_error.put_nowait(exc)
 
         capture_thread = threading.Thread(target=capture_reader, name="rtsp-reader", daemon=True)
         capture_thread.start()
 
         try:
             while True:
-                if capture_error:
-                    raise RuntimeError("RTSP reader failed") from capture_error[0]
+                reader_error = current_capture_error()
+                if reader_error is not None:
+                    raise RuntimeError("RTSP reader failed") from reader_error
                 try:
                     timestamp, frame = frame_queue.get(timeout=2.0)
                     frame_queue.task_done()
                 except queue.Empty:
-                    if capture_error:
-                        raise RuntimeError("RTSP reader failed") from capture_error[0]
+                    reader_error = current_capture_error()
+                    if reader_error is not None:
+                        raise RuntimeError("RTSP reader failed") from reader_error
                     raise RuntimeError("Timed out waiting for frame from RTSP reader")
 
                 self._push_prebuffer(timestamp, frame)
@@ -739,12 +795,21 @@ class RtspVehicleWatcher:
                 process_this_frame = self.frame_index % self.config.process_every_n_frames == 0
                 motion_area = self.last_motion_area
                 had_motion = False
-                triggered_zone_ids: set[str] = set()
+                triggered_zone_ids: Set[str] = set()
                 overlay = self._draw_monitor_overlays(frame.copy())
 
                 raw_motion = False
                 if process_this_frame:
-                    motion_area, raw_motion, best_box, overlay, triggered_zone_ids, zone_area_by_id = self._detect_motion(frame)
+                    (
+                        motion_area,
+                        raw_motion,
+                        best_box,
+                        overlay,
+                        triggered_zone_ids,
+                        zone_area_by_id,
+                        zone_coverage_percent_by_id,
+                        coverage_triggered_zone_ids,
+                    ) = self._detect_motion(frame)
                     if raw_motion:
                         self.motion_streak = min(self.config.min_consecutive_hits, self.motion_streak + 1)
                         self.last_triggered_zone_ids = set(triggered_zone_ids)
@@ -752,10 +817,15 @@ class RtspVehicleWatcher:
                         self.motion_streak = max(0, self.motion_streak - 1)
                         if self.motion_streak == 0:
                             self.last_triggered_zone_ids = set()
-                    had_motion = self.motion_streak >= self.config.min_consecutive_hits
+                    coverage_confirmed = bool(coverage_triggered_zone_ids)
+                    if coverage_confirmed:
+                        self.last_triggered_zone_ids.update(coverage_triggered_zone_ids)
+                    had_motion = self.motion_streak >= self.config.min_consecutive_hits or coverage_confirmed
                     self.last_motion_area = motion_area
                     self.last_motion_box = best_box
                     self.last_zone_area_by_id = dict(zone_area_by_id)
+                    self.last_zone_coverage_percent_by_id = dict(zone_coverage_percent_by_id)
+                    self.last_coverage_triggered_zone_ids = set(coverage_triggered_zone_ids)
                     overlay = self._annotate_motion_overlay(
                         overlay,
                         motion_area,
@@ -763,6 +833,8 @@ class RtspVehicleWatcher:
                         had_motion,
                         triggered_zone_ids if triggered_zone_ids else self.last_triggered_zone_ids,
                         zone_area_by_id,
+                        zone_coverage_percent_by_id,
+                        coverage_triggered_zone_ids,
                     )
                     if self.config.debug_windows:
                         cv2.imshow("watcher", overlay)
@@ -780,6 +852,8 @@ class RtspVehicleWatcher:
                         had_motion,
                         self.last_triggered_zone_ids,
                         self.last_zone_area_by_id,
+                        self.last_zone_coverage_percent_by_id,
+                        self.last_coverage_triggered_zone_ids,
                     )
 
                 self._update_latest_frames(overlay, frame)
@@ -870,12 +944,9 @@ class RtspVehicleWatcher:
             if self.last_capture_time is not None:
                 last_capture_age = max(0.0, now - self.last_capture_time)
             recording = self.video_recording
-            return {
+            snapshot = {
                 "uptime_seconds": max(0.0, now - self.capture_started_at),
                 "camera_fps_estimate": float(self.fps_guess),
-                "capture_fps": self._rolling_fps(capture_times),
-                "processing_fps": self._rolling_fps(processing_times),
-                "stream_fps": self._rolling_fps(stream_times),
                 "configured_stream_fps": float(self.config.stream_fps),
                 "capture_frame_total": self.capture_frame_total,
                 "processing_frame_total": self.processing_frame_total,
@@ -895,6 +966,10 @@ class RtspVehicleWatcher:
                 "recording_fps": float(recording.fps) if recording else 0.0,
                 "motion_status": self.latest_motion_status,
             }
+        snapshot["capture_fps"] = self._rolling_fps(capture_times)
+        snapshot["processing_fps"] = self._rolling_fps(processing_times)
+        snapshot["stream_fps"] = self._rolling_fps(stream_times)
+        return snapshot
 
     def _push_prebuffer(self, timestamp: float, frame) -> None:
         self.prebuffer.append((timestamp, frame.copy()))
@@ -948,22 +1023,35 @@ class RtspVehicleWatcher:
             frame = cv2.resize(frame, (width, height))
         return np.ascontiguousarray(frame)
 
-    def _start_video_recording(self, timestamp: float, triggered_zone_ids: set[str], confirmed: bool = False) -> None:
+    def _video_prebuffer_seconds(self) -> float:
+        if self.config.prebuffer_frames > 0 and self.fps_guess > 0:
+            return self.config.prebuffer_frames / max(self.fps_guess, 1.0)
+        return max(self.config.prebuffer_seconds, VIDEO_PREBUFFER_SECONDS)
+
+    def _start_video_recording(self, timestamp: float, triggered_zone_ids: Set[str], confirmed: bool = False) -> None:
         if self.video_recording is not None:
             return
+        record_seconds = self._record_seconds_for_zone_ids(triggered_zone_ids)
         video_dir = self._video_output_dir()
         stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         output_path = video_dir / f"{self.config.camera_name}_{stamp}.mp4"
         temp_output_path = self._video_temp_dir() / output_path.name
         high_res_url = self._effective_alpr_rtsp_url()
-        if high_res_url and high_res_url != self.config.rtsp_url and shutil.which("ffmpeg"):
+        use_direct_high_res_recorder = (
+            high_res_url
+            and high_res_url != self.config.rtsp_url
+            and shutil.which("ffmpeg")
+            and self._video_prebuffer_seconds() <= 0.0
+        )
+        if use_direct_high_res_recorder:
             try:
                 transport = self._rtsp_option_value("rtsp_transport", "tcp") or "tcp"
-                writer = DirectRtspVideoRecorder(high_res_url, temp_output_path, transport, VIDEO_RECORDING_SECONDS)
+                writer = DirectRtspVideoRecorder(high_res_url, temp_output_path, transport, record_seconds)
                 self.video_recording = VideoRecording(
                     started_at=timestamp,
                     first_frame_at=timestamp,
-                    ends_at=timestamp + VIDEO_RECORDING_SECONDS,
+                    ends_at=timestamp + record_seconds,
+                    record_seconds=record_seconds,
                     started_from_zone_ids=set(triggered_zone_ids),
                     output_path=output_path,
                     temp_output_path=temp_output_path,
@@ -976,20 +1064,26 @@ class RtspVehicleWatcher:
                 )
                 status = "confirmed motion" if confirmed else "motion warning"
                 logging.info(
-                    "Started 3-minute 101 video recording at %s on %s for zones=%s",
+                    "Started %.0f-second 101 video recording at %s on %s for zones=%s",
+                    record_seconds,
                     output_path,
                     status,
                     ",".join(sorted(triggered_zone_ids)) or "unknown",
                 )
                 self._add_event_log(
                     "video",
-                    f"Started 101 video {output_path.name} on {status} for zones={','.join(sorted(triggered_zone_ids)) or 'unknown'}",
+                    f"Started 101 video {output_path.name} for {int(round(record_seconds))}s on {status} for zones={','.join(sorted(triggered_zone_ids)) or 'unknown'}",
                 )
                 return
             except Exception:
                 temp_output_path.unlink(missing_ok=True)
                 logging.exception("Failed to start 101 video recording; falling back to motion stream frames")
                 self._add_event_log("video", "Failed to start 101 video; falling back to motion stream frames")
+        elif high_res_url and high_res_url != self.config.rtsp_url and confirmed:
+            self._add_event_log(
+                "video",
+                f"Using motion-stream video for {output_path.name} so the clip includes pre-event buffer",
+            )
         prebuffer_frames = [
             (frame_timestamp, frame_copy)
             for frame_timestamp, frame_copy in self.prebuffer
@@ -1044,7 +1138,8 @@ class RtspVehicleWatcher:
         self.video_recording = VideoRecording(
             started_at=timestamp,
             first_frame_at=first_frame_at,
-            ends_at=timestamp + VIDEO_RECORDING_SECONDS,
+            ends_at=timestamp + record_seconds,
+            record_seconds=record_seconds,
             started_from_zone_ids=set(triggered_zone_ids),
             output_path=output_path,
             temp_output_path=temp_output_path,
@@ -1057,14 +1152,15 @@ class RtspVehicleWatcher:
         )
         status = "confirmed motion" if confirmed else "motion warning"
         logging.info(
-            "Started 3-minute video recording at %s on %s for zones=%s",
+            "Started %.0f-second video recording at %s on %s for zones=%s",
+            record_seconds,
             output_path,
             status,
             ",".join(sorted(triggered_zone_ids)) or "unknown",
         )
         self._add_event_log(
             "video",
-            f"Started motion-stream video {output_path.name} on {status} for zones={','.join(sorted(triggered_zone_ids)) or 'unknown'}",
+            f"Started motion-stream video {output_path.name} for {int(round(record_seconds))}s on {status} for zones={','.join(sorted(triggered_zone_ids)) or 'unknown'}",
         )
 
     def _append_video_recording_frame(self, timestamp: float, frame) -> None:
@@ -1191,7 +1287,7 @@ class RtspVehicleWatcher:
             )
             thread.start()
         status = "confirmed motion" if confirmed else "motion warning"
-        logging.info("Started high-resolution ALPR sampler from %s on %s", high_res_url, status)
+        logging.info("Started high-resolution ALPR sampler from %s on %s", redact_url_credentials(high_res_url), status)
 
     def _run_alpr_capture_session(self, stop_event: threading.Event, frames: Deque[CandidateFrame]) -> None:
         if shutil.which("ffmpeg") and self._effective_alpr_rtsp_url():
@@ -1282,7 +1378,7 @@ class RtspVehicleWatcher:
                             logging.warning("Dropped bad 101 ALPR sampler frame count=%s", bad_frames)
                         continue
                     bad_frames = 0
-                    frames.append(self._candidate_from_alpr_frame(frame, time.time()))
+                    frames.append(self._candidate_from_alpr_frame(frame=frame, timestamp=time.time()))
         finally:
             process.terminate()
             try:
@@ -1293,9 +1389,10 @@ class RtspVehicleWatcher:
 
     def _capture_alpr_candidate(self, timestamp: Optional[float] = None) -> CandidateFrame:
         frame = self._capture_single_alpr_frame()
-        return self._candidate_from_alpr_frame(frame, timestamp or time.time())
+        candidate_timestamp = time.time() if timestamp is None else timestamp
+        return self._candidate_from_alpr_frame(frame=frame, timestamp=candidate_timestamp)
 
-    def _candidate_from_alpr_frame(self, frame, timestamp: float) -> CandidateFrame:
+    def _candidate_from_alpr_frame(self, frame: Any, timestamp: float) -> CandidateFrame:
         crop = self._plate_crop(frame)
         return CandidateFrame(
             frame=frame.copy(),
@@ -1411,7 +1508,7 @@ class RtspVehicleWatcher:
         return self._derive_hikvision_101_url(self.config.rtsp_url)
 
     def _derive_hikvision_101_url(self, rtsp_url: str) -> str:
-        return re.sub(r"(?i)(/Streaming/Channels/)102\\b", r"\g<1>101", rtsp_url)
+        return re.sub(r"(?i)(/Streaming/Channels/)102\b", r"\g<1>101", rtsp_url)
 
     def _rtsp_option_value(self, name: str, default: str = "") -> str:
         parts = [part.strip() for part in self.config.rtsp_capture_options.split("|") if part.strip()]
@@ -1475,7 +1572,7 @@ class RtspVehicleWatcher:
                     "zone_ids": sorted(recording.started_from_zone_ids),
                     "event_count": len(recording.pending_events),
                     "prebuffer_seconds": VIDEO_PREBUFFER_SECONDS,
-                    "recording_seconds": VIDEO_RECORDING_SECONDS,
+                    "recording_seconds": recording.record_seconds,
                 },
                 indent=2,
             )
@@ -1551,7 +1648,10 @@ class RtspVehicleWatcher:
             )
         return frame
 
-    def _detect_motion(self, frame) -> Tuple[int, bool, Optional[Tuple[int, int, int, int]], Any, set[str], dict[str, int]]:
+    def _detect_motion(
+        self,
+        frame,
+    ) -> Tuple[int, bool, Optional[Tuple[int, int, int, int]], Any, Set[str], dict[str, int], dict[str, float], Set[str]]:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
         mask = self.background.apply(gray)
@@ -1562,13 +1662,17 @@ class RtspVehicleWatcher:
 
         total_area = 0
         best_box = None
-        triggered_zone_ids: set[str] = set()
+        triggered_zone_ids: Set[str] = set()
         zone_area_by_id: dict[str, int] = {}
+        zone_coverage_percent_by_id: dict[str, float] = {}
+        coverage_triggered_zone_ids: Set[str] = set()
         for zone in self.motion_zones:
             if not zone.enabled:
                 continue
             x1, y1, x2, y2 = self._zone_bounds(frame, zone)
             zone_mask = mask[y1:y2, x1:x2]
+            zone_pixel_area = max(1, zone_mask.shape[0] * zone_mask.shape[1])
+            moving_pixel_area = int(cv2.countNonZero(zone_mask))
             contours, _ = cv2.findContours(zone_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             zone_total_area = 0
             zone_best_box = None
@@ -1583,6 +1687,8 @@ class RtspVehicleWatcher:
                 if zone_best_box is None or area > zone_best_box[0]:
                     zone_best_box = (area, x, y, w, h)
             zone_area_by_id[zone.zone_id] = zone_total_area
+            zone_coverage_percent = min(100.0, (moving_pixel_area / float(zone_pixel_area)) * 100.0)
+            zone_coverage_percent_by_id[zone.zone_id] = zone_coverage_percent
             if zone_total_area >= self.config.min_motion_area:
                 triggered_zone_ids.add(zone.zone_id)
                 total_area += zone_total_area
@@ -1594,6 +1700,8 @@ class RtspVehicleWatcher:
                         zone_best_box[3],
                         zone_best_box[4],
                     )
+            if zone_coverage_percent >= zone.coverage_trigger_percent > 0.0:
+                coverage_triggered_zone_ids.add(zone.zone_id)
 
         overlay = self._draw_monitor_overlays(frame.copy())
         absolute_best_box = None
@@ -1602,7 +1710,16 @@ class RtspVehicleWatcher:
             absolute_best_box = (x, y, x + w, y + h)
 
         had_motion = bool(triggered_zone_ids)
-        return total_area, had_motion, absolute_best_box, overlay, triggered_zone_ids, zone_area_by_id
+        return (
+            total_area,
+            had_motion,
+            absolute_best_box,
+            overlay,
+            triggered_zone_ids,
+            zone_area_by_id,
+            zone_coverage_percent_by_id,
+            coverage_triggered_zone_ids,
+        )
 
     def _annotate_motion_overlay(
         self,
@@ -1610,16 +1727,23 @@ class RtspVehicleWatcher:
         motion_area: int,
         best_box: Optional[Tuple[int, int, int, int]],
         confirmed_motion: bool,
-        triggered_zone_ids: set[str],
+        triggered_zone_ids: Set[str],
         zone_area_by_id: dict[str, int],
+        zone_coverage_percent_by_id: dict[str, float],
+        coverage_triggered_zone_ids: Set[str],
     ):
         if best_box:
             box_color = (0, 255, 0) if confirmed_motion else (0, 200, 255)
             cv2.rectangle(overlay, (best_box[0], best_box[1]), (best_box[2], best_box[3]), box_color, 2)
-        status = "confirmed" if confirmed_motion else f"warming {min(self.motion_streak, self.config.min_consecutive_hits)}/{self.config.min_consecutive_hits}"
+        if confirmed_motion and coverage_triggered_zone_ids:
+            status = f"confirmed coverage={','.join(sorted(coverage_triggered_zone_ids))}"
+        elif confirmed_motion:
+            status = "confirmed"
+        else:
+            status = f"warming {min(self.motion_streak, self.config.min_consecutive_hits)}/{self.config.min_consecutive_hits}"
         zones_text = ",".join(sorted(triggered_zone_ids)) if triggered_zone_ids else "none"
         per_zone = " ".join(
-            f"{zone.zone_id}={int(zone_area_by_id.get(zone.zone_id, 0))}"
+            f"{zone.zone_id}={int(zone_area_by_id.get(zone.zone_id, 0))} ({zone_coverage_percent_by_id.get(zone.zone_id, 0.0):.0f}%)"
             for zone in self.motion_zones
             if zone.enabled
         )
@@ -1628,7 +1752,7 @@ class RtspVehicleWatcher:
         self.latest_motion_status = f"{label} | {detail_label}"
         return overlay
 
-    def _on_motion(self, timestamp: float, frame, motion_area: int, triggered_zone_ids: set[str]) -> None:
+    def _on_motion(self, timestamp: float, frame, motion_area: int, triggered_zone_ids: Set[str]) -> None:
         sharpness = self._compute_sharpness(frame)
         candidate = CandidateFrame(
             frame=frame.copy(),
@@ -1661,6 +1785,11 @@ class RtspVehicleWatcher:
         self.event.last_motion_at = timestamp
         self.event.frames_since_motion = 0
         self.event.zones_triggered.update(triggered_zone_ids)
+        recording = self.video_recording
+        if recording is not None:
+            recording.started_from_zone_ids.update(triggered_zone_ids)
+            recording.ends_at = max(recording.ends_at, timestamp + self._record_seconds_for_zone_ids(self.event.zones_triggered))
+            recording.record_seconds = max(recording.record_seconds, recording.ends_at - recording.started_at)
         self.event.candidates.append(candidate)
         self._append_event_frame(timestamp, frame, count_as_postbuffer=False)
 
@@ -1682,7 +1811,7 @@ class RtspVehicleWatcher:
     def _event_exceeded_max_duration(self, timestamp: float) -> bool:
         if not self.event:
             return False
-        return timestamp - self.event.started_at >= self.config.event_max_seconds
+        return timestamp - self.event.started_at >= self._record_seconds_for_zone_ids(self.event.zones_triggered)
 
     def _run_detection_pipeline(
         self,
@@ -1796,7 +1925,7 @@ class RtspVehicleWatcher:
                 logging.warning("No video-extracted frame available for %s zone image", zone.zone_id)
                 self._add_event_log("image", f"No video-extracted frame available for {zone.zone_id} zone image")
                 continue
-            candidates = sorted(candidates, key=lambda item: item.timestamp)
+            candidates = self._select_timeline_candidates(candidates, zone.image_count)
             for index, candidate in enumerate(candidates, start=1):
                 crop = self._zone_crop(candidate.frame, zone)
                 image_path = event_dir / f"zone_{zone.zone_id}_{index:02d}.jpg"
@@ -1895,13 +2024,11 @@ class RtspVehicleWatcher:
         if source_video_path is None or source_video_first_frame_at is None:
             logging.warning("No finalized local video is available; using in-memory event frames instead")
             self._add_event_log("image", "No finalized local video is available; using in-memory event frames instead")
-            source_video_path = None
-            source_video_first_frame_at = None
 
         stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         event_dir = self.config.image_output_dir / f"{self.config.camera_name}_{stamp}"
         event_dir.mkdir(parents=True, exist_ok=True)
-        image_limit = self.config.upload_top_frames
+        image_limit = self._image_limit_for_zone_ids(event.zones_triggered)
         event_start_at = event.frames[0][0] if event.frames else event.started_at
         selected: List[CandidateFrame] = []
         if source_video_path is not None and source_video_first_frame_at is not None:
@@ -1914,7 +2041,7 @@ class RtspVehicleWatcher:
                 image_limit,
             )
         if not selected:
-            selected = self._fallback_event_candidates(event)
+            selected = self._fallback_event_candidates(event, image_limit)
             if selected:
                 logging.warning(
                     "Falling back to in-memory event frames for %s because video extraction returned no frames",
@@ -1994,9 +2121,12 @@ class RtspVehicleWatcher:
         logging.info("Event saved to %s", event_dir)
 
     def _select_best_frames(
-        self, event: Event, preferred_candidates: Optional[List[CandidateFrame]] = None
+        self,
+        event: Event,
+        preferred_candidates: Optional[List[CandidateFrame]] = None,
+        image_limit: Optional[int] = None,
     ) -> List[CandidateFrame]:
-        image_limit = self.config.upload_top_frames
+        image_limit = max(1, image_limit or self._image_limit_for_zone_ids(event.zones_triggered))
         if preferred_candidates:
             return self._select_timeline_candidates(preferred_candidates, image_limit)
         candidates = [
@@ -2093,8 +2223,8 @@ class RtspVehicleWatcher:
             for index in range(limit)
         ]
 
-    def _fallback_event_candidates(self, event: Event) -> List[CandidateFrame]:
-        selected = self._select_best_frames(event)
+    def _fallback_event_candidates(self, event: Event, image_limit: Optional[int] = None) -> List[CandidateFrame]:
+        selected = self._select_best_frames(event, image_limit=image_limit)
         fallback_candidates: List[CandidateFrame] = []
         for candidate in selected:
             jpeg_bytes = candidate.jpeg_bytes or self._encode_jpeg(candidate.frame)
@@ -2188,7 +2318,7 @@ class RtspVehicleWatcher:
         return "\n".join(lines)[:1000]
 
     def _send_telegram_alert(self, event_name: str, summary: dict[str, Any], image_paths: List[Path]) -> None:
-        if not self.config.telegram_enabled:
+        if not self.config.telegram_configured:
             return
         chat_id = self._resolve_telegram_chat_id()
         if not chat_id:
@@ -2291,6 +2421,9 @@ class RtspVehicleWatcher:
                     "label": zone.label,
                     "use_fast_alpr": zone.use_fast_alpr,
                     "send_telegram": zone.send_telegram,
+                    "record_seconds": zone.record_seconds,
+                    "image_count": zone.image_count,
+                    "coverage_trigger_percent": zone.coverage_trigger_percent,
                 }
             )
         return summary
@@ -2632,7 +2765,10 @@ class RtspVehicleWatcher:
                         while True:
                             chunk = process.stdout.read(65536)
                             if not chunk:
-                                break
+                                if process.poll() is not None:
+                                    break
+                                time.sleep(0.05)
+                                continue
                             buffer += chunk
                             while True:
                                 start = buffer.find(b"\xff\xd8")
@@ -2738,6 +2874,9 @@ class RtspVehicleWatcher:
                 "enabled": zone.enabled,
                 "use_fast_alpr": zone.use_fast_alpr,
                 "send_telegram": zone.send_telegram,
+                "record_seconds": float(zone.record_seconds),
+                "image_count": int(zone.image_count),
+                "coverage_trigger_percent": float(zone.coverage_trigger_percent),
                 "color": zone.color_hex,
                 "fill": zone.fill_rgba,
             }
@@ -2752,7 +2891,7 @@ class RtspVehicleWatcher:
         }
 
     def _env_file_path(self) -> Path:
-        return Path(os.getenv("ALPR_ENV_FILE", ".env")).expanduser()
+        return Path(os.getenv("ALPR_ENV_FILE") or os.getenv("APP_ENV_FILE") or ".env").expanduser()
 
     def _read_env_text(self) -> str:
         env_path = self._env_file_path()
@@ -2767,7 +2906,7 @@ class RtspVehicleWatcher:
         return f"""<div class="panel">
   <div id="roi-editor" style="position:relative; max-width:100%;">
     <img id="roi-stream" style="width:100%; max-width:100%; border-radius:14px; border:1px solid #334155; display:block;" src="/stream-clean.mjpg" alt="Live stream">
-    <div id="roi-overlay" style="position:absolute; inset:0; pointer-events:none;">
+    <div id="roi-overlay" style="position:absolute; inset:0; pointer-events:auto; touch-action:none;">
       <div id="roi-box-yellow" style="position:absolute; border:3px solid #facc15; background:rgba(250,204,21,0.12); box-sizing:border-box; pointer-events:none;"></div>
       <div id="roi-box-purple" style="position:absolute; border:3px solid #c084fc; background:rgba(192,132,252,0.16); box-sizing:border-box; pointer-events:none;"></div>
       <button class="roi-handle" data-corner="tl" style="position:absolute;"></button>
@@ -2784,6 +2923,15 @@ class RtspVehicleWatcher:
       </div>
       <label style="display:block; margin-top:10px; color:#cbd5e1;"><input id="zone-fast-alpr-yellow" type="checkbox" checked> Send to fast-alpr</label>
       <label style="display:block; margin-top:10px; color:#cbd5e1;"><input id="zone-telegram-yellow" type="checkbox" checked> Send to Telegram</label>
+      <label style="display:block; margin-top:10px; color:#cbd5e1;">Record time
+        <select id="zone-record-seconds-yellow" style="display:block; width:100%; margin-top:6px; background:#07110f; color:#edf7f2; border:1px solid #334155; border-radius:8px; padding:8px;"></select>
+      </label>
+      <label style="display:block; margin-top:10px; color:#cbd5e1;">Saved images
+        <select id="zone-image-count-yellow" style="display:block; width:100%; margin-top:6px; background:#07110f; color:#edf7f2; border:1px solid #334155; border-radius:8px; padding:8px;"></select>
+      </label>
+      <label style="display:block; margin-top:10px; color:#cbd5e1;">Coverage trigger
+        <select id="zone-coverage-trigger-yellow" style="display:block; width:100%; margin-top:6px; background:#07110f; color:#edf7f2; border:1px solid #334155; border-radius:8px; padding:8px;"></select>
+      </label>
     </div>
     <div style="background:#0f172a; border:1px solid #334155; border-radius:8px; padding:12px;">
       <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
@@ -2792,6 +2940,15 @@ class RtspVehicleWatcher:
       </div>
       <label style="display:block; margin-top:10px; color:#cbd5e1;"><input id="zone-fast-alpr-purple" type="checkbox"> Send to fast-alpr</label>
       <label style="display:block; margin-top:10px; color:#cbd5e1;"><input id="zone-telegram-purple" type="checkbox"> Send to Telegram</label>
+      <label style="display:block; margin-top:10px; color:#cbd5e1;">Record time
+        <select id="zone-record-seconds-purple" style="display:block; width:100%; margin-top:6px; background:#07110f; color:#edf7f2; border:1px solid #334155; border-radius:8px; padding:8px;"></select>
+      </label>
+      <label style="display:block; margin-top:10px; color:#cbd5e1;">Saved images
+        <select id="zone-image-count-purple" style="display:block; width:100%; margin-top:6px; background:#07110f; color:#edf7f2; border:1px solid #334155; border-radius:8px; padding:8px;"></select>
+      </label>
+      <label style="display:block; margin-top:10px; color:#cbd5e1;">Coverage trigger
+        <select id="zone-coverage-trigger-purple" style="display:block; width:100%; margin-top:6px; background:#07110f; color:#edf7f2; border:1px solid #334155; border-radius:8px; padding:8px;"></select>
+      </label>
     </div>
   </div>
   <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:14px;">
@@ -2848,14 +3005,69 @@ class RtspVehicleWatcher:
     yellow: document.getElementById('zone-telegram-yellow'),
     purple: document.getElementById('zone-telegram-purple'),
   }};
-  if (!editor || !overlay || !img || !saveBtn || !resetBtn || !status || !sensitivity || !sensitivityValue || !sensitivitySave || handles.length !== 4 || !zoneBoxes.yellow || !zoneBoxes.purple || !zoneButtons.yellow || !zoneButtons.purple || !zoneEnabled.yellow || !zoneEnabled.purple || !zoneFastAlpr.yellow || !zoneFastAlpr.purple || !zoneTelegram.yellow || !zoneTelegram.purple) return;
+  const zoneRecordSeconds = {{
+    yellow: document.getElementById('zone-record-seconds-yellow'),
+    purple: document.getElementById('zone-record-seconds-purple'),
+  }};
+  const zoneImageCount = {{
+    yellow: document.getElementById('zone-image-count-yellow'),
+    purple: document.getElementById('zone-image-count-purple'),
+  }};
+  const zoneCoverageTrigger = {{
+    yellow: document.getElementById('zone-coverage-trigger-yellow'),
+    purple: document.getElementById('zone-coverage-trigger-purple'),
+  }};
+  if (!editor || !overlay || !img || !saveBtn || !resetBtn || !status || !sensitivity || !sensitivityValue || !sensitivitySave || handles.length !== 4 || !zoneBoxes.yellow || !zoneBoxes.purple || !zoneButtons.yellow || !zoneButtons.purple || !zoneEnabled.yellow || !zoneEnabled.purple || !zoneFastAlpr.yellow || !zoneFastAlpr.purple || !zoneTelegram.yellow || !zoneTelegram.purple || !zoneRecordSeconds.yellow || !zoneRecordSeconds.purple || !zoneImageCount.yellow || !zoneImageCount.purple || !zoneCoverageTrigger.yellow || !zoneCoverageTrigger.purple) return;
 
   let zones = initialZones.map((zone) => ({{ ...zone, roi: zone.roi.slice() }}));
   let activeZoneId = null;
   let dragCorner = null;
+  let dragMove = null;
   let currentMotionArea = initialMotionArea;
   const minSize = 0.03;
   const handleSize = 18;
+  const recordTimeOptions = [
+    {{ value: 15, label: '15 seconds' }},
+    {{ value: 30, label: '30 seconds' }},
+    {{ value: 45, label: '45 seconds' }},
+    {{ value: 60, label: '1 minute' }},
+    {{ value: 90, label: '1.5 minutes' }},
+    {{ value: 120, label: '2 minutes' }},
+    {{ value: 180, label: '3 minutes' }},
+    {{ value: 240, label: '4 minutes' }},
+    {{ value: 300, label: '5 minutes' }},
+  ];
+  const imageCountOptions = [1, 2, 3, 5, 10, 20, 40, 80, 120, 180, 240];
+  const coverageTriggerOptions = [
+    {{ value: 0, label: 'Off' }},
+    {{ value: 10, label: '10%' }},
+    {{ value: 20, label: '20%' }},
+    {{ value: 30, label: '30%' }},
+    {{ value: 40, label: '40%' }},
+    {{ value: 50, label: '50%' }},
+    {{ value: 60, label: '60%' }},
+    {{ value: 70, label: '70%' }},
+    {{ value: 80, label: '80%' }},
+    {{ value: 90, label: '90%' }},
+  ];
+
+  function populateSelectOptions(select, options, labelForValue) {{
+    select.innerHTML = options
+      .map((option) => {{
+        if (typeof option === 'object') {{
+          return `<option value="${{option.value}}">${{option.label}}</option>`;
+        }}
+        return `<option value="${{option}}">${{labelForValue(option)}}</option>`;
+      }})
+      .join('');
+  }}
+
+  populateSelectOptions(zoneRecordSeconds.yellow, recordTimeOptions, (value) => `${{value}} seconds`);
+  populateSelectOptions(zoneRecordSeconds.purple, recordTimeOptions, (value) => `${{value}} seconds`);
+  populateSelectOptions(zoneImageCount.yellow, imageCountOptions, (value) => `${{value}} images`);
+  populateSelectOptions(zoneImageCount.purple, imageCountOptions, (value) => `${{value}} images`);
+  populateSelectOptions(zoneCoverageTrigger.yellow, coverageTriggerOptions, (value) => `${{value}}%`);
+  populateSelectOptions(zoneCoverageTrigger.purple, coverageTriggerOptions, (value) => `${{value}}%`);
 
   function clamp(value, min, max) {{
     return Math.min(max, Math.max(min, value));
@@ -2887,11 +3099,36 @@ class RtspVehicleWatcher:
     return zones.find((zone) => zone.id === zoneId);
   }}
 
+  function getNormalizedPointer(clientX, clientY) {{
+    const rect = overlay.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    return {{
+      x: clamp((clientX - rect.left) / rect.width, 0, 1),
+      y: clamp((clientY - rect.top) / rect.height, 0, 1),
+    }};
+  }}
+
+  function findZoneAt(x, y) {{
+    const activeZone = activeZoneId ? findZone(activeZoneId) : null;
+    const orderedZones = activeZone
+      ? [activeZone, ...zones.filter((zone) => zone.id !== activeZone.id)]
+      : zones.slice();
+    for (const zone of orderedZones) {{
+      if (!zone.enabled) continue;
+      const [x1, y1, x2, y2] = zone.roi;
+      if (x >= x1 && x <= x2 && y >= y1 && y <= y2) return zone;
+    }}
+    return null;
+  }}
+
   function syncZoneControls() {{
     zones.forEach((zone) => {{
       zoneEnabled[zone.id].checked = Boolean(zone.enabled);
       zoneFastAlpr[zone.id].checked = Boolean(zone.use_fast_alpr);
       zoneTelegram[zone.id].checked = Boolean(zone.send_telegram);
+      zoneRecordSeconds[zone.id].value = String(Math.round(zone.record_seconds || 180));
+      zoneImageCount[zone.id].value = String(Math.round(zone.image_count || 1));
+      zoneCoverageTrigger[zone.id].value = String(Math.round(zone.coverage_trigger_percent || 0));
       zoneButtons[zone.id].style.outline = zone.id === activeZoneId ? `2px solid ${{zone.color}}` : 'none';
       zoneButtons[zone.id].textContent = zone.id === activeZoneId ? `Editing ${{zone.label}}` : `Edit ${{zone.label}}`;
     }});
@@ -2914,6 +3151,7 @@ class RtspVehicleWatcher:
       box.style.background = zone.fill;
       box.style.opacity = '1';
       box.style.borderWidth = zone.id === activeZoneId ? '4px' : '3px';
+      box.style.cursor = zone.id === activeZoneId ? 'move' : 'pointer';
     }});
     const activeZone = activeZoneId ? findZone(activeZoneId) : null;
     if (!activeZone || !activeZone.enabled) {{
@@ -2924,7 +3162,7 @@ class RtspVehicleWatcher:
         handle.style.pointerEvents = 'none';
       }});
       syncZoneControls();
-      const zoneSummaries = zones.map((zone) => `${{zone.label}}: ${{zone.enabled ? 'on' : 'off'}}, ${{zone.use_fast_alpr ? 'fast-alpr' : 'images only'}}, ${{zone.send_telegram ? 'telegram' : 'no telegram'}}`);
+      const zoneSummaries = zones.map((zone) => `${{zone.label}}: ${{zone.enabled ? 'on' : 'off'}}, ${{zone.use_fast_alpr ? 'fast-alpr' : 'images only'}}, ${{zone.send_telegram ? 'telegram' : 'no telegram'}}, ${{Math.round(zone.record_seconds)}}s, ${{Math.round(zone.image_count)}} images, coverage ${{Math.round(zone.coverage_trigger_percent)}}%`);
       setStatus(`Motion zones saved | ${{zoneSummaries.join(' | ')}}`);
       return;
     }}
@@ -2950,47 +3188,96 @@ class RtspVehicleWatcher:
       handle.style.padding = '0';
     }});
     syncZoneControls();
-    const zoneSummaries = zones.map((zone) => `${{zone.label}}: ${{zone.enabled ? 'on' : 'off'}}, ${{zone.use_fast_alpr ? 'fast-alpr' : 'images only'}}, ${{zone.send_telegram ? 'telegram' : 'no telegram'}}`);
+    const zoneSummaries = zones.map((zone) => `${{zone.label}}: ${{zone.enabled ? 'on' : 'off'}}, ${{zone.use_fast_alpr ? 'fast-alpr' : 'images only'}}, ${{zone.send_telegram ? 'telegram' : 'no telegram'}}, ${{Math.round(zone.record_seconds)}}s, ${{Math.round(zone.image_count)}} images, coverage ${{Math.round(zone.coverage_trigger_percent)}}%`);
     setStatus(`Editing ${{activeZone.label}} | ROI: ${{activeZone.roi.map((v) => v.toFixed(3)).join(', ')}} | ${{zoneSummaries.join(' | ')}}`);
   }}
 
   function updateFromPointer(clientX, clientY) {{
-    const rect = overlay.getBoundingClientRect();
-    if (!rect.width || !rect.height || !dragCorner) return;
-    const x = clamp((clientX - rect.left) / rect.width, 0, 1);
-    const y = clamp((clientY - rect.top) / rect.height, 0, 1);
+    const point = getNormalizedPointer(clientX, clientY);
+    if (!point) return;
+    const x = point.x;
+    const y = point.y;
     const activeZone = findZone(activeZoneId);
     if (!activeZone) return;
-    let [x1, y1, x2, y2] = activeZone.roi;
-    if (dragCorner.includes('l')) x1 = clamp(x, 0, x2 - minSize);
-    if (dragCorner.includes('r')) x2 = clamp(x, x1 + minSize, 1);
-    if (dragCorner.includes('t')) y1 = clamp(y, 0, y2 - minSize);
-    if (dragCorner.includes('b')) y2 = clamp(y, y1 + minSize, 1);
-    activeZone.roi = [x1, y1, x2, y2];
+    if (dragCorner) {{
+      let [x1, y1, x2, y2] = activeZone.roi;
+      if (dragCorner.includes('l')) x1 = clamp(x, 0, x2 - minSize);
+      if (dragCorner.includes('r')) x2 = clamp(x, x1 + minSize, 1);
+      if (dragCorner.includes('t')) y1 = clamp(y, 0, y2 - minSize);
+      if (dragCorner.includes('b')) y2 = clamp(y, y1 + minSize, 1);
+      activeZone.roi = [x1, y1, x2, y2];
+    }} else if (dragMove) {{
+      const nextX1 = clamp(x - dragMove.offsetX, 0, 1 - dragMove.width);
+      const nextY1 = clamp(y - dragMove.offsetY, 0, 1 - dragMove.height);
+      activeZone.roi = [nextX1, nextY1, nextX1 + dragMove.width, nextY1 + dragMove.height];
+    }} else {{
+      return;
+    }}
     draw();
+  }}
+
+  function stopDragging() {{
+    dragCorner = null;
+    dragMove = null;
   }}
 
   handles.forEach((handle) => {{
     handle.addEventListener('pointerdown', (event) => {{
       dragCorner = handle.dataset.corner;
+      dragMove = null;
       handle.setPointerCapture(event.pointerId);
       event.preventDefault();
+      event.stopPropagation();
     }});
     handle.addEventListener('pointermove', (event) => {{
       if (!dragCorner) return;
       updateFromPointer(event.clientX, event.clientY);
     }});
     handle.addEventListener('pointerup', () => {{
-      dragCorner = null;
+      stopDragging();
     }});
     handle.addEventListener('pointercancel', () => {{
-      dragCorner = null;
+      stopDragging();
     }});
+  }});
+
+  overlay.addEventListener('pointerdown', (event) => {{
+    if (event.target.closest('.roi-handle')) return;
+    const point = getNormalizedPointer(event.clientX, event.clientY);
+    if (!point) return;
+    const hitZone = findZoneAt(point.x, point.y);
+    if (!hitZone) return;
+    activeZoneId = hitZone.id;
+    const [x1, y1, x2, y2] = hitZone.roi;
+    dragCorner = null;
+    dragMove = {{
+      offsetX: point.x - x1,
+      offsetY: point.y - y1,
+      width: x2 - x1,
+      height: y2 - y1,
+    }};
+    overlay.setPointerCapture(event.pointerId);
+    draw();
+    event.preventDefault();
+  }});
+
+  overlay.addEventListener('pointermove', (event) => {{
+    if (!dragMove) return;
+    updateFromPointer(event.clientX, event.clientY);
+  }});
+
+  overlay.addEventListener('pointerup', () => {{
+    stopDragging();
+  }});
+
+  overlay.addEventListener('pointercancel', () => {{
+    stopDragging();
   }});
 
   resetBtn.addEventListener('click', () => {{
     zones = initialZones.map((zone) => ({{ ...zone, roi: zone.roi.slice() }}));
     activeZoneId = null;
+    stopDragging();
     draw();
   }});
 
@@ -3029,6 +3316,33 @@ class RtspVehicleWatcher:
     }});
   }});
 
+  Object.entries(zoneRecordSeconds).forEach(([zoneId, select]) => {{
+    select.addEventListener('change', () => {{
+      const zone = findZone(zoneId);
+      if (!zone) return;
+      zone.record_seconds = Number(select.value) || zone.record_seconds;
+      draw();
+    }});
+  }});
+
+  Object.entries(zoneImageCount).forEach(([zoneId, select]) => {{
+    select.addEventListener('change', () => {{
+      const zone = findZone(zoneId);
+      if (!zone) return;
+      zone.image_count = Number(select.value) || zone.image_count;
+      draw();
+    }});
+  }});
+
+  Object.entries(zoneCoverageTrigger).forEach(([zoneId, select]) => {{
+    select.addEventListener('change', () => {{
+      const zone = findZone(zoneId);
+      if (!zone) return;
+      zone.coverage_trigger_percent = Number(select.value) || 0;
+      draw();
+    }});
+  }});
+
   sensitivity.addEventListener('input', () => {{
     currentMotionArea = Number(sensitivity.value);
     renderSensitivity();
@@ -3047,7 +3361,7 @@ class RtspVehicleWatcher:
       zones = payload.zones.map((zone) => ({{ ...zone, roi: zone.roi.slice() }}));
       initialZones.splice(0, initialZones.length, ...zones.map((zone) => ({{ ...zone, roi: zone.roi.slice() }})));
       activeZoneId = null;
-      dragCorner = null;
+      stopDragging();
       draw();
       setStatus('Saved motion zones.');
     }} catch (error) {{
@@ -3607,7 +3921,7 @@ pre {{ white-space: pre-wrap; word-break: break-word; background: #050c0b; paddi
         if total_items <= page_size:
             return ""
         total_pages = max(1, (total_items + page_size - 1) // page_size)
-        extra_params = {key: value for key, value in (extra_params or {}).items() if value}
+        extra_params = {key: value for key, value in (extra_params or {}).items() if value is not None}
 
         def page_href(target_page: int) -> str:
             params = {"page": str(target_page)}
@@ -3956,7 +4270,7 @@ a {{ color: #93c5fd; }}
             payload = json.loads(handler.rfile.read(content_length) or b"{}")
             zones_payload = payload.get("zones")
             if isinstance(zones_payload, list):
-                seen_zone_ids: set[str] = set()
+                seen_zone_ids: Set[str] = set()
                 for zone_payload in zones_payload:
                     if not isinstance(zone_payload, dict):
                         raise ValueError("Each zone must be an object")
@@ -3974,6 +4288,12 @@ a {{ color: #93c5fd; }}
                     zone.enabled = bool(zone_payload.get("enabled", zone.enabled))
                     zone.use_fast_alpr = bool(zone_payload.get("use_fast_alpr", zone.use_fast_alpr))
                     zone.send_telegram = bool(zone_payload.get("send_telegram", zone.send_telegram))
+                    zone.record_seconds = max(1.0, float(zone_payload.get("record_seconds", zone.record_seconds)))
+                    zone.image_count = max(1, int(zone_payload.get("image_count", zone.image_count)))
+                    zone.coverage_trigger_percent = min(
+                        100.0,
+                        max(0.0, float(zone_payload.get("coverage_trigger_percent", zone.coverage_trigger_percent))),
+                    )
                     seen_zone_ids.add(zone_id)
                 if "yellow" not in seen_zone_ids:
                     raise ValueError("Yellow zone is required")
@@ -4103,7 +4423,10 @@ a {{ color: #93c5fd; }}
         try:
             content_length = int(handler.headers.get("Content-Length", "0"))
             payload = json.loads(handler.rfile.read(content_length) or b"{}")
-            epoch_ms = float(payload.get("epoch_ms"))
+            epoch_ms_value = payload.get("epoch_ms")
+            if epoch_ms_value is None:
+                raise ValueError("epoch_ms is required")
+            epoch_ms = float(epoch_ms_value)
             epoch_seconds = epoch_ms / 1000.0
             target_time = datetime.fromtimestamp(epoch_seconds)
             if target_time.year < 2020 or target_time.year > 2100:
@@ -4155,9 +4478,9 @@ a {{ color: #93c5fd; }}
             apply_runtime = bool(payload.get("apply", False))
             env_path = self._env_file_path()
             env_path.parent.mkdir(parents=True, exist_ok=True)
-            if env_path.exists():
-                env_path.with_suffix(env_path.suffix + ".bak").write_text(env_path.read_text())
-            env_path.write_text(content)
+            temp_path = env_path.with_suffix(env_path.suffix + ".tmp")
+            temp_path.write_text(content)
+            temp_path.replace(env_path)
             apply_result: dict[str, Any] = {}
             if apply_runtime:
                 apply_result = self._apply_env_content_to_runtime(content)
@@ -4216,8 +4539,6 @@ a {{ color: #93c5fd; }}
         self.config.video_output_dir.mkdir(parents=True, exist_ok=True)
         self.runtime_config_path = self.config.event_output_dir.parent / "watcher-config.json"
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self.config.rtsp_capture_options
-        for key, value in env_values.items():
-            os.environ[key] = value
 
         primary_zone = self._find_motion_zone("yellow")
         if primary_zone and self.config.roi:
@@ -4262,30 +4583,28 @@ a {{ color: #93c5fd; }}
             ".mp4": "video/mp4",
             ".json": "application/json",
         }[target.suffix.lower()]
-        body = target.read_bytes()
         handler.send_response(HTTPStatus.OK)
         handler.send_header("Content-Type", content_type)
-        handler.send_header("Content-Length", str(len(body)))
+        handler.send_header("Content-Length", str(target.stat().st_size))
         handler.end_headers()
-        handler.wfile.write(body)
+        with target.open("rb") as file_obj:
+            while True:
+                chunk = file_obj.read(FILE_STREAM_CHUNK_SIZE)
+                if not chunk:
+                    break
+                handler.wfile.write(chunk)
 
     def _handle_test_upload(self, handler: BaseHTTPRequestHandler) -> None:
-        form = cgi.FieldStorage(
-            fp=handler.rfile,
-            headers=handler.headers,
-            environ={
-                "REQUEST_METHOD": "POST",
-                "CONTENT_TYPE": handler.headers.get("Content-Type", ""),
-            },
-        )
-        file_item = form["image"] if "image" in form else None
-        if file_item is None or not getattr(file_item, "file", None):
-            handler.send_error(HTTPStatus.BAD_REQUEST, "Missing image upload")
-            return
-
-        payload = file_item.file.read()
-        if not payload:
-            handler.send_error(HTTPStatus.BAD_REQUEST, "Empty image upload")
+        try:
+            _, files = self._read_multipart_form(handler)
+            image_file = files.get("image")
+            if image_file is None:
+                raise ValueError("Missing image upload")
+            payload = bytes(image_file.get("payload") or b"")
+            if not payload:
+                raise ValueError("Empty image upload")
+        except Exception as exc:
+            handler.send_error(HTTPStatus.BAD_REQUEST, str(exc))
             return
 
         frame_array = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -4434,24 +4753,59 @@ a {{ color: #93c5fd; }}
         payload = parse_qs(raw_body.decode("utf-8", errors="replace"))
         return {str(key): str(values[0]) for key, values in payload.items() if values}
 
+    def _read_multipart_form(
+        self,
+        handler: BaseHTTPRequestHandler,
+        max_bytes: int = MAX_IMAGE_UPLOAD_BYTES,
+    ) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+        content_type = handler.headers.get("Content-Type", "")
+        if not content_type.lower().startswith("multipart/form-data"):
+            raise ValueError("Expected multipart/form-data upload")
+        content_length = int(handler.headers.get("Content-Length", "0") or "0")
+        if content_length <= 0:
+            raise ValueError("Empty multipart request")
+        if content_length > max_bytes:
+            raise ValueError(f"Upload is too large (max {max_bytes // (1024 * 1024)} MB)")
+        raw_body = handler.rfile.read(content_length)
+        message = BytesParser(policy=email_policy).parsebytes(
+            (
+                f"Content-Type: {content_type}\r\n"
+                "MIME-Version: 1.0\r\n"
+                "\r\n"
+            ).encode("utf-8")
+            + raw_body
+        )
+        fields: dict[str, str] = {}
+        files: dict[str, dict[str, Any]] = {}
+        for part in message.iter_parts():
+            if part.get_content_disposition() != "form-data":
+                continue
+            name = part.get_param("name", header="content-disposition")
+            if not name:
+                continue
+            payload = part.get_payload(decode=True) or b""
+            filename = part.get_filename()
+            if filename is None:
+                fields[name] = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+            else:
+                files[name] = {
+                    "filename": filename,
+                    "content_type": part.get_content_type(),
+                    "payload": payload,
+                }
+        return fields, files
+
     def _handle_video_snapshot_fast_alpr(self, handler: BaseHTTPRequestHandler) -> None:
         try:
             if not self.config.fast_alpr_url:
                 raise ValueError("FAST_ALPR_URL is not configured")
-            form = cgi.FieldStorage(
-                fp=handler.rfile,
-                headers=handler.headers,
-                environ={
-                    "REQUEST_METHOD": "POST",
-                    "CONTENT_TYPE": handler.headers.get("Content-Type", ""),
-                },
-            )
-            image_item = form["image"] if "image" in form else None
-            if image_item is None or not getattr(image_item, "file", None):
+            fields, files = self._read_multipart_form(handler)
+            image_item = files.get("image")
+            if image_item is None:
                 raise ValueError("Missing snapshot image")
-            video_path_value = form.getfirst("video_path", "")
+            video_path_value = fields.get("video_path", "")
             video_path = self._saved_video_path_from_relative(str(video_path_value))
-            image_bytes = image_item.file.read()
+            image_bytes = bytes(image_item.get("payload") or b"")
             if not image_bytes:
                 raise ValueError("Snapshot image is empty")
             frame_array = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -4460,7 +4814,7 @@ a {{ color: #93c5fd; }}
 
             position_seconds = 0.0
             try:
-                position_seconds = float(form.getfirst("position_seconds", "0") or 0.0)
+                position_seconds = float(fields.get("position_seconds", "0") or 0.0)
             except ValueError:
                 position_seconds = 0.0
 
@@ -5308,9 +5662,11 @@ def main() -> None:
     config = Config.from_env()
     log_dir = Path(os.getenv("LOG_OUTPUT_DIR", str(config.event_output_dir.parent / "logs"))).expanduser()
     log_dir.mkdir(parents=True, exist_ok=True)
+    logging.Formatter.converter = time.localtime
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S %Z %z",
         handlers=[
             logging.StreamHandler(sys.stdout),
             logging.FileHandler(log_dir / "watcher.log"),

@@ -12,6 +12,7 @@ services:
     env_file:
       - ${APP_ENV_FILE:-/mnt/localdisk/pi-alpr/config/.env}
     environment:
+      TZ: ${TZ:-Asia/Jerusalem}
       FAST_ALPR_URL: http://fast-alpr:8090
       EVENT_OUTPUT_DIR: ${EVENT_OUTPUT_DIR:-/data/events}
       IMAGE_OUTPUT_DIR: ${IMAGE_OUTPUT_DIR:-/data/events/images}
@@ -46,6 +47,7 @@ services:
     ports:
       - "8090:8090"
     environment:
+      TZ: ${TZ:-Asia/Jerusalem}
       PORT: "8090"
       FAST_ALPR_OCR_DEVICE: "cpu"
       FAST_ALPR_DETECTOR_CONF: "0.4"
