@@ -55,7 +55,7 @@ class RtspVehicleWatcher:
         self.motion_zones = self._default_motion_zones()
         self._load_runtime_config()
         self.client = OpenAlprClient(config)
-        self.prebuffer: Deque[Tuple[float, Any]] = deque(maxlen=500)
+        self.prebuffer: Deque[Tuple[float, Any]] = deque(maxlen=max(500, int(MAX_VIDEO_PREBUFFER_FRAMES * 2)))
         self.event: Optional[Event] = None
         self.motion_streak = 0
         self.last_motion_area = 0
@@ -619,6 +619,13 @@ class RtspVehicleWatcher:
                         self._start_video_recording(timestamp, triggered_zone_ids, confirmed=True)
                     else:
                         self.video_recording.started_from_zone_ids.update(triggered_zone_ids)
+                        # Guarantee minimum duration from confirmation time for the triggered zones
+                        min_ends_at = timestamp + self._record_seconds_for_zone_ids(triggered_zone_ids)
+                        self.video_recording.ends_at = max(self.video_recording.ends_at, min_ends_at)
+                        self.video_recording.record_seconds = max(
+                            self.video_recording.record_seconds,
+                            self.video_recording.ends_at - self.video_recording.started_at,
+                        )
                         if not self.video_recording.confirmed:
                             self.video_recording.confirmed = True
                             logging.info("Confirmed video recording for active motion event")
@@ -783,7 +790,7 @@ class RtspVehicleWatcher:
     def _video_prebuffer_seconds(self) -> float:
         if self.config.prebuffer_frames > 0 and self.fps_guess > 0:
             return self.config.prebuffer_frames / max(self.fps_guess, 1.0)
-        return max(0.0, self.config.prebuffer_seconds)
+        return max(VIDEO_PREBUFFER_SECONDS, self.config.prebuffer_seconds)
 
     def _start_video_recording(self, timestamp: float, triggered_zone_ids: Set[str], confirmed: bool = False) -> None:
         if self.video_recording is not None:
@@ -1753,7 +1760,7 @@ class RtspVehicleWatcher:
                     "video finalized",
                     source_video_path=recording.output_path,
                     source_video_first_frame_at=recording.first_frame_at,
-                    source_video_ends_at=recording.ends_at,
+                    source_video_ends_at=recording.first_frame_at + self._saved_video_duration_seconds(recording.output_path),
                 )
             except Exception:
                 logging.exception("Failed to extract event images from %s", recording.output_path)
@@ -2492,6 +2499,9 @@ class RtspVehicleWatcher:
                     return
                 if path == "/api/videos/upload":
                     watcher._handle_video_upload(self)
+                    return
+                if path == "/api/extraction-cancel":
+                    watcher._handle_extraction_cancel(self)
                     return
                 if path == "/test":
                     watcher._handle_test_upload(self)
@@ -3295,7 +3305,14 @@ a { color: #7dd3fc; }
 .nav-links a { color: #cde8de; text-decoration: none; border: 1px solid #2f514b; border-radius: 8px; padding: 8px 11px; background: #10211f; line-height: 1; }
 .nav-links a:hover { border-color: #5eead4; color: #f8fafc; background: #17302d; }
 .nav-links a.active { border-color: #facc15; color: #111827; background: #facc15; font-weight: 700; }
-.system-clock { color: #d9f99d; border: 1px solid #2f514b; border-radius: 8px; background: #07110f; padding: 8px 11px; white-space: nowrap; font-variant-numeric: tabular-nums; line-height: 1; }
+.topbar-status { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.system-clock, .extraction-indicator { color: #d9f99d; border: 1px solid #2f514b; border-radius: 8px; background: #07110f; padding: 8px 11px; white-space: nowrap; font-variant-numeric: tabular-nums; line-height: 1; }
+.extraction-indicator { display: none; align-items: center; gap: 7px; }
+.extraction-indicator.is-visible { display: inline-flex; }
+.extraction-indicator svg { width: 14px; height: 14px; fill: currentColor; flex-shrink: 0; }
+.extraction-stop { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 8px; border: 1px solid #2f514b; background: #10211f; color: #d9f99d; cursor: pointer; padding: 0; flex-shrink: 0; }
+.extraction-stop:hover { border-color: #fca5a5; color: #fee2e2; background: #450a0a; }
+.extraction-stop svg { width: 11px; height: 11px; }
 .menu-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
 .menu-actions form { margin: 0; }
 .menu-actions button { color: #fee2e2; text-decoration: none; border: 1px solid #7f1d1d; border-radius: 8px; padding: 8px 11px; background: #450a0a; line-height: 1; cursor: pointer; font: inherit; }
@@ -3316,7 +3333,8 @@ h1 { margin-top: 0; }
   .topbar { align-items: flex-start; flex-direction: column; }
   .nav-links { justify-content: flex-start; }
   .nav-links a { padding: 9px 10px; }
-  .system-clock { padding: 9px 10px; }
+  .topbar-status { justify-content: flex-start; }
+  .system-clock, .extraction-indicator { padding: 9px 10px; }
   .menu-actions { justify-content: flex-start; }
   .menu-actions button { padding: 9px 10px; }
 }
@@ -3359,7 +3377,14 @@ h1 { margin-top: 0; }
         return f"""<header class="topbar">
   <a class="brand" href="/">ALPR Watcher</a>
   <nav class="nav-links" aria-label="Main navigation">{links}</nav>
-  <span class="system-clock" id="system-clock" title="System clock">--:--:--</span>
+  <div class="topbar-status">
+    <span class="system-clock" id="system-clock" title="System clock">--:--:--</span>
+    <span class="extraction-indicator" id="extraction-indicator" title="Image extraction progress" aria-live="polite">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2ZM5 5h14v9.6l-3.2-3.2a1 1 0 0 0-1.4 0L11 14.8l-1.4-1.4a1 1 0 0 0-1.4 0L5 16.6V5Zm14 14H5v-.6l3.9-3.9 1.4 1.4a1 1 0 0 0 1.4 0l3.4-3.4 3.9 3.9V19ZM8.5 10A1.5 1.5 0 1 0 8.5 7a1.5 1.5 0 0 0 0 3Z"/></svg>
+      <span id="extraction-counter">0/0</span>
+      <button class="extraction-stop" id="extraction-stop" type="button" aria-label="Stop image extraction" title="Stop image extraction"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6h12v12H6z"/></svg></button>
+    </span>
+  </div>
   {actions}
 </header>
 <script>
@@ -3390,6 +3415,75 @@ h1 { margin-top: 0; }
   syncClockDisplay();
   setInterval(renderClock, 1000);
   setInterval(syncClockDisplay, 30000);
+}})();
+
+(() => {{
+  const indicator = document.getElementById('extraction-indicator');
+  const counter = document.getElementById('extraction-counter');
+  const stopBtn = document.getElementById('extraction-stop');
+  if (!indicator || !counter || !stopBtn) return;
+
+  let activeJobId = null;
+  let pollTimer = null;
+
+  function showIndicator(jobId) {{
+    activeJobId = jobId;
+    indicator.classList.add('is-visible');
+    counter.textContent = '0/?';
+  }}
+
+  function hideIndicator() {{
+    activeJobId = null;
+    indicator.classList.remove('is-visible');
+    if (pollTimer) {{ clearInterval(pollTimer); pollTimer = null; }}
+  }}
+
+  window.__startExtractionIndicator = function(jobId) {{
+    showIndicator(jobId);
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(async () => {{
+      try {{
+        const r = await fetch('/api/extraction-status', {{ cache: 'no-store' }});
+        const status = await r.json();
+        const job = status[jobId];
+        if (!job) return;
+        if (job.done || job.stage === 'cancelled') {{
+          counter.textContent = job.stage === 'cancelled' ? `stopped (${{job.saved}})` : `done (${{job.saved}})`;
+          setTimeout(hideIndicator, 3000);
+          clearInterval(pollTimer); pollTimer = null;
+          if (window.__onExtractionDone) window.__onExtractionDone(jobId, job);
+        }} else {{
+          const total = job.total || '?';
+          counter.textContent = `${{job.saved}}/${{total}}`;
+        }}
+      }} catch (e) {{}}
+    }}, 500);
+  }};
+
+  stopBtn.addEventListener('click', async () => {{
+    if (!activeJobId) return;
+    stopBtn.disabled = true;
+    try {{
+      await fetch('/api/extraction-cancel', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ job_id: activeJobId }}),
+      }});
+      counter.textContent = 'stopping...';
+    }} catch (e) {{}}
+    finally {{
+      window.setTimeout(() => {{ stopBtn.disabled = false; }}, 1000);
+    }}
+  }});
+
+  (async () => {{
+    try {{
+      const r = await fetch('/api/extraction-status', {{ cache: 'no-store' }});
+      const status = await r.json();
+      const active = Object.entries(status).reverse().find(([, job]) => job && !job.done && job.stage !== 'cancelled');
+      if (active) window.__startExtractionIndicator(active[0]);
+    }} catch (e) {{}}
+  }})();
 }})();
 
 (() => {{
@@ -4612,7 +4706,7 @@ a {{ color: #93c5fd; }}
             apply_runtime = bool(payload.get("apply", False))
             env_path = self._env_file_path()
             env_path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path = env_path.with_suffix(env_path.suffix + ".tmp")
+            temp_path = Path("/tmp") / (env_path.name + ".tmp")
             temp_path.write_text(content)
             temp_path.replace(env_path)
             apply_result: dict[str, Any] = {}
@@ -5205,6 +5299,7 @@ a {{ color: #93c5fd; }}
                     "total": expected_total,
                     "video": video_path.name,
                     "error": None,
+                    "cancel": False,
                     "stage": "sampling",
                 }
                 try:
@@ -5226,6 +5321,11 @@ a {{ color: #93c5fd; }}
                     self.extraction_status[job_id]["stage"] = "saving"
                     failed_frames = 0
                     for index, position_seconds in enumerate(target_seconds, start=1):
+                        if self.extraction_status[job_id].get("cancel"):
+                            self.extraction_status[job_id]["done"] = True
+                            self.extraction_status[job_id]["stage"] = "cancelled"
+                            self._add_event_log("image", f"Extraction cancelled after {len(saved_paths)} images from {video_path.name}")
+                            return
                         frame = self._extract_local_video_frame_with_ffmpeg(video_path, position_seconds)
                         if frame is None:
                             failed_frames += 1
@@ -5290,6 +5390,27 @@ a {{ color: #93c5fd; }}
             handler.send_header("Content-Length", str(len(body)))
             handler.end_headers()
             handler.wfile.write(body)
+    def _handle_extraction_cancel(self, handler: BaseHTTPRequestHandler) -> None:
+        try:
+            content_length = int(handler.headers.get("Content-Length", "0") or "0")
+            payload = json.loads(handler.rfile.read(content_length) or b"{}")
+            job_id = str(payload.get("job_id") or "")
+            if job_id and job_id in self.extraction_status:
+                self.extraction_status[job_id]["cancel"] = True
+            body = json.dumps({"ok": True}).encode("utf-8")
+            handler.send_response(HTTPStatus.OK)
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+        except Exception as exc:
+            body = json.dumps({"error": str(exc)}).encode("utf-8")
+            handler.send_response(HTTPStatus.BAD_REQUEST)
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+
     def _handle_video_upload(self, handler: BaseHTTPRequestHandler) -> None:
         try:
             _, files = self._read_multipart_form(handler, max_bytes=500 * 1024 * 1024)
@@ -5799,7 +5920,7 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
       const detail = form.dataset.actionDetail || 'Please wait while the request completes.';
       if (submitter) submitter.disabled = true;
       if (submitter && form.action.includes('/api/videos/extract-images')) submitter.classList.add('busy');
-      if (statusEl) statusEl.textContent = '0';
+      if (statusEl) statusEl.textContent = '';
       if (overlay) setOverlayState(label + '...', detail);
       try {
         const formData = new FormData(form);
@@ -5818,6 +5939,7 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
         } else if (data.job_id) {
           if (overlay) setOverlayState('Extracting images…', 'Starting…', false);
           const jobId = data.job_id;
+          if (window.__startExtractionIndicator) window.__startExtractionIndicator(jobId);
           const poll = setInterval(async () => {
             try {
               const r = await fetch('/api/extraction-status', { cache: 'no-store' });
@@ -5834,11 +5956,16 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
                 clearInterval(poll);
                 if (submitter) submitter.classList.remove('busy');
                 if (submitter) submitter.disabled = false;
-                if (statusEl) statusEl.textContent = `${job.saved}`;
-                if (overlay) setOverlayState('Done', `Saved ${job.saved} images from ${job.video}. Open the Images page to review them.`, true);
+                if (statusEl) statusEl.textContent = job.stage === 'cancelled' ? 'Stopped' : `${job.saved}`;
+                if (overlay) {
+                  if (job.stage === 'cancelled') {
+                    setOverlayState('Stopped', `Saved ${job.saved} images from ${job.video} before stopping.`, true);
+                  } else {
+                    setOverlayState('Done', `Saved ${job.saved} images from ${job.video}. Open the Images page to review them.`, true);
+                  }
+                }
               } else {
                 const total = job.total || '?';
-                if (statusEl) statusEl.textContent = `${job.saved}/${total}`;
                 if (overlay) setOverlayState('Extracting images…', `Saved ${job.saved} of ${total} images from ${job.video}`, false);
               }
             } catch (e) {}
