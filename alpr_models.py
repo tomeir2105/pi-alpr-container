@@ -14,7 +14,7 @@ VIDEO_RECORDING_SECONDS = 180.0
 DEFAULT_FRAME_WIDTH = 960
 MAX_RECORDING_FPS = 15.0
 MAX_VIDEO_PREBUFFER_FRAMES = 30
-VIDEO_WRITER_QUEUE_SECONDS = 8.0
+VIDEO_WRITER_QUEUE_SECONDS = 3.0
 DEFAULT_RTSP_CAPTURE_OPTIONS = "rtsp_transport;tcp|max_delay;2000000|stimeout;10000000"
 DEFAULT_ALPR_CAPTURE_FPS = 1.0
 GALLERY_PAGE_SIZE = 24
@@ -207,6 +207,18 @@ class Event:
     last_frame_at: float
     frames_since_motion: int
     zones_triggered: Set[str]
+    MAX_FRAMES: int = field(default=500, repr=False)
+    MAX_CANDIDATES: int = field(default=200, repr=False)
+
+    def append_frame(self, timestamp: float, frame: Any) -> None:
+        if len(self.frames) >= self.MAX_FRAMES:
+            self.frames.pop(0)
+        self.frames.append((timestamp, frame))
+
+    def append_candidate(self, candidate: "CandidateFrame") -> None:
+        if len(self.candidates) >= self.MAX_CANDIDATES:
+            self.candidates.pop(0)
+        self.candidates.append(candidate)
 
 
 @dataclass
@@ -241,6 +253,12 @@ class VideoRecording:
     last_written_at: float
     frame_size: Tuple[int, int]
     fps: float
+    last_frame: Any = None
     source_url: str = ""
     confirmed: bool = False
     pending_events: List[Event] = field(default_factory=list)
+    MAX_PENDING_EVENTS: int = field(default=20, repr=False)
+
+    def append_pending_event(self, event: "Event") -> None:
+        if len(self.pending_events) < self.MAX_PENDING_EVENTS:
+            self.pending_events.append(event)

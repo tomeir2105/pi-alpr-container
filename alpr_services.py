@@ -11,6 +11,9 @@ from alpr_models import Config, VIDEO_WRITER_QUEUE_SECONDS
 
 
 class FfmpegVideoWriter:
+    FINALIZE_TIMEOUT_SECONDS = 30
+    KILL_TIMEOUT_SECONDS = 10
+
     def __init__(self, output_path: Path, fps: float, frame_size: Tuple[int, int], threads: int) -> None:
         width, height = frame_size
         self.output_path = output_path
@@ -61,15 +64,21 @@ class FfmpegVideoWriter:
         if self.process.stdin:
             self.process.stdin.close()
             self.process.stdin = None
-        stderr = self.process.stderr.read() if self.process.stderr else b""
-        self.process.wait()
+        try:
+            _, stderr = self.process.communicate(timeout=self.FINALIZE_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            self.process.kill()
+            _, stderr = self.process.communicate(timeout=self.KILL_TIMEOUT_SECONDS)
+            message = stderr.decode("utf-8", errors="replace").strip() if stderr else ""
+            detail = f": {message}" if message else ""
+            raise RuntimeError(f"ffmpeg timed out finalizing {self.output_path}{detail}") from exc
         if self.process.returncode != 0:
             message = stderr.decode("utf-8", errors="replace").strip()
             raise RuntimeError(f"ffmpeg failed to write {self.output_path}: {message}")
 
 
 class DirectRtspVideoRecorder:
-    def __init__(self, source_url: str, output_path: Path, transport: str, duration_seconds: float) -> None:
+    def __init__(self, source_url: str, output_path: Path, transport: str, duration_seconds: float, threads: int = 1) -> None:
         normalized_source_url = source_url.strip()
         lower_source_url = normalized_source_url.lower()
         if not lower_source_url.startswith("rtsp://"):
@@ -78,6 +87,7 @@ class DirectRtspVideoRecorder:
             raise ValueError(f"Direct RTSP recorder cannot record from an HLS playlist source: {source_url}")
         self.source_url = normalized_source_url
         self.output_path = output_path
+        self.duration_seconds = duration_seconds
         self.process = subprocess.Popen(
             [
                 "ffmpeg",
@@ -85,13 +95,25 @@ class DirectRtspVideoRecorder:
                 "-loglevel",
                 "error",
                 "-y",
+                "-fflags",
+                "+discardcorrupt+genpts",
                 "-rtsp_transport",
                 transport,
                 "-i",
                 self.source_url,
                 "-an",
                 "-c:v",
-                "copy",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-threads",
+                str(max(1, threads)),
+                "-vf",
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                "-pix_fmt",
+                "yuv420p",
+                "-avoid_negative_ts",
+                "make_zero",
                 "-movflags",
                 "+faststart",
                 str(output_path),
@@ -110,16 +132,24 @@ class DirectRtspVideoRecorder:
                     self.process.stdin.write(b"q\n")
                     self.process.stdin.flush()
                     self.process.stdin.close()
+                    self.process.stdin = None
                 except Exception:
                     self.process.terminate()
             else:
                 self.process.terminate()
             try:
-                self.process.wait(timeout=5)
+                self.process.wait(timeout=60)
             except subprocess.TimeoutExpired:
                 self.process.kill()
-                self.process.wait(timeout=5)
-        stderr = self.process.stderr.read() if self.process.stderr else b""
+                self.process.wait(timeout=10)
+        try:
+            _, stderr = self.process.communicate(timeout=10)
+        except subprocess.TimeoutExpired as exc:
+            self.process.kill()
+            _, stderr = self.process.communicate(timeout=10)
+            message = stderr.decode("utf-8", errors="replace").strip() if stderr else ""
+            detail = f": {message}" if message else ""
+            raise RuntimeError(f"ffmpeg timed out finalizing {self.output_path}{detail}") from exc
         if self.process.returncode not in {0, 255, -15}:
             message = stderr.decode("utf-8", errors="replace").strip()
             raise RuntimeError(f"ffmpeg failed to record {self.output_path}: {message}")

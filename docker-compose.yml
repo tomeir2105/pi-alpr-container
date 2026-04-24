@@ -5,8 +5,8 @@ services:
     container_name: pi-alpr-watcher
     restart: unless-stopped
     read_only: true
-    mem_limit: 1g
-    cpus: "1.50"
+    mem_limit: 512m
+    cpus: "0.50"
     logging:
       driver: ${DOCKER_LOG_DRIVER:-none}
     env_file:

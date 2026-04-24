@@ -1,11 +1,10 @@
 # RTSP to OpenALPR Watcher
 
-This project pulls an RTSP stream from your home camera, detects passing motion locally, samples event frames across the full motion timeline, optionally checks frames with a remote or local `fast-alpr` HTTP service, and uploads qualifying frames to Rekor/OpenALPR for cloud recognition.
+This project pulls a single RTSP stream from your camera, detects passing motion locally, records event clips on the Pi, optionally checks frames with a remote or local `fast-alpr` HTTP service, and uploads qualifying frames to OpenALPR for cloud recognition.
 
 It also exposes a local dashboard UI:
 
 - Unified dashboard: `http://127.0.0.1:8080/`
-- Full-screen live video: `http://127.0.0.1:8080/live`
 - Configuration editor: `http://127.0.0.1:8080/stats`
 - Captured images: `http://127.0.0.1:8080/images`
 - Saved videos: `http://127.0.0.1:8080/videos`
@@ -20,13 +19,14 @@ Persistent data is stored under:
 
 ## How it works
 
-1. The script opens your RTSP stream.
+1. The script opens one RTSP stream.
 2. It watches a configurable road region of interest (ROI).
 3. When motion in that ROI looks vehicle-sized for several consecutive checks, it starts an event.
 4. It keeps a short pre-roll and post-roll buffer so the saved clip includes the full pass.
-5. If configured, it sends event frames to a `fast-alpr` service first.
-6. It uploads qualifying frames to the OpenALPR cloud API.
-7. It stores the clip, uploaded frames, API responses, and a summary on disk.
+5. It records the event video locally on the Pi from that same stream.
+6. If the triggered zone has `Fast-ALPR` enabled, it extracts event images and runs `fast-alpr` first.
+7. It uploads qualifying frames to the OpenALPR cloud API.
+8. It stores the clip, extracted frames, API responses, and a summary on disk.
 
 ## Files
 
@@ -54,14 +54,11 @@ Edit `/mnt/localdisk/pi-alpr/config/.env` and set:
 - `OPENALPR_COUNTRY`
 - `ROI`
 
-For Hikvision cameras, a typical stream setup is:
+Typical setup:
 
 ```dotenv
-RTSP_URL=rtsp://username:password@camera-host:554/Streaming/Channels/102
-ALPR_RTSP_URL=rtsp://username:password@camera-host:554/Streaming/Channels/101
+RTSP_URL=rtsp://username:password@camera-host:554/stream
 ```
-
-Use channel `102` for the lighter motion stream and channel `101` for sharper ALPR images.
 
 If you want local filtering before OpenALPR, also set:
 
@@ -97,7 +94,6 @@ docker compose up -d --build
 When the watcher is running, open:
 
 - `http://127.0.0.1:8080/`
-- `http://127.0.0.1:8080/live`
 - `http://127.0.0.1:8080/stats`
 - `http://127.0.0.1:8080/images`
 - `http://127.0.0.1:8080/videos`
@@ -105,20 +101,18 @@ When the watcher is running, open:
 
 ## Web UI
 
-- The dashboard shows the editable motion zones and motion sensitivity controls.
-- The live page shows only the camera feed full-screen.
+- The dashboard shows the live camera view, editable motion zones, and motion sensitivity controls.
 - The config page edits `.env`; recreate the watcher container after saving Docker env-file changes.
 - The images page opens image details in the same tab and supports keyboard navigation: left arrow for newer images, right arrow for older images.
-- The videos page opens video details in the same tab with the top menu still visible.
-- The top menu includes remove buttons for saved images, saved videos, and detected plate entries.
+- The videos page supports local uploads, manual image extraction from video, snapshot-to-ALPR, and clip playback.
+- Remove actions in Images, Videos, and Plates use a double-click confirmation with a color change.
 - The plates page includes the detection test upload link.
 
 ## Tuning
 
 - `ROI` should cover only the driveway or road where cars pass.
-- Hikvision channel `101` is usually the high-resolution main stream; use `102` when the main stream smears or the host cannot decode it at camera FPS.
-- `ALPR_RTSP_URL` should point at the high-resolution `101` stream so live view and saved event images use the sharper camera feed while motion detection can stay on `RTSP_URL`; Hikvision `.../Channels/102` URLs are automatically tried as `.../Channels/101` if `ALPR_RTSP_URL` is blank.
-- `PLATE_ROI` can be a tighter sub-zone where plates are expected to appear; this powers the zoom panel and crops frames before ALPR runs.
+- The watcher now uses a single camera stream for motion detection, dashboard live view, image creation, and local video recording.
+- `PLATE_ROI` can be a tighter sub-zone where plates are expected to appear; this crops frames before ALPR runs.
 - `FRAME_WIDTH=960` keeps processing, streaming, and recordings bounded. Use `0` only if the host has enough CPU/RAM for the camera's native resolution.
 - `MIN_MOTION_AREA` filters out tiny motion like rain, trees, and shadows.
 - `MIN_CONSECUTIVE_HITS` helps avoid one-frame false triggers.
@@ -128,17 +122,18 @@ When the watcher is running, open:
 - `POSTBUFFER_FRAMES` overrides `POSTBUFFER_SECONDS` if you prefer an exact frame count.
 - `EVENT_IDLE_SECONDS` is how long motion must stop before the event can close.
 - `EVENT_MAX_SECONDS` forces an event to close even if motion detection keeps reporting movement.
-- `UPLOAD_TOP_FRAMES` controls how many images are sampled across the event/video timeline; the default keeps 240 images per kept event.
+- `UPLOAD_TOP_FRAMES` controls how many images are sampled across the event/video timeline or manual video extraction job.
 - `UPLOAD_MIN_SHARPNESS` skips blurry frames when possible.
 - `FAST_ALPR_URL` enables plate recognition before cloud upload and can point to another Pi.
 - `FAST_ALPR_MIN_CONFIDENCE` is the minimum local OCR confidence required before a frame is sent to OpenALPR.
+- Automatic image creation from motion video happens only when the triggered zone has `Fast-ALPR` enabled.
+- If `Fast-ALPR` is disabled for the zone, the motion event still records video, but images are created only when you press the extract button on the Videos page.
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `TELEGRAM_ALERT_IMAGES` configure Telegram photo alerts for movement events.
 - `TELEGRAM_ALERTS_ENABLED` sets the startup default for per-zone Telegram alerts; the dashboard zone checkboxes can turn alerts on or off at runtime.
 - `PLATE_ROI` crops frames to the likely plate area before local/cloud ALPR and powers the zoomed monitoring panel.
 - `WEB_PORT` controls the local monitoring UI port.
 - `MAX_SAVED_IMAGES` limits how many JPG captures are kept across all events; the default keeps the newest 2000 images.
 - `STREAM_FPS` controls the dashboard MJPEG refresh rate without slowing the RTSP reader.
-- `ALPR_CAPTURE_FPS` controls how often the 101 stream is sampled for saved event images; `ALPR_CAPTURE_WARMUP_SECONDS` and `LIVE_STREAM_WARMUP_SECONDS` skip unstable frames right after opening 101.
 - `CAPTURE_BUFFER_SIZE` and `RTSP_CAPTURE_OPTIONS` favor stable TCP capture over lowest-latency capture to avoid H.264 smear from damaged reference frames.
 - `HOST_DATA_DIR` controls the host folder mounted into both containers as `/data`; keep it on `/mnt/localdisk` to avoid saving outputs on the OS disk.
 - `APP_ENV_FILE` controls the `.env` file mounted into the watcher; keep it under `/mnt/localdisk` so config saves from the UI stay off the OS disk.
@@ -171,7 +166,6 @@ The active runtime config is `/mnt/localdisk/pi-alpr/config/.env`. Keep real cam
 ```dotenv
 PROCESS_EVERY_N_FRAMES=2
 FRAME_WIDTH=960
-ALPR_RTSP_URL=rtsp://username:password@camera-host:554/Streaming/Channels/101
 MIN_MOTION_AREA=2500
 MIN_CONSECUTIVE_HITS=3
 EVENT_IDLE_SECONDS=1.5
@@ -194,9 +188,6 @@ FFMPEG_THREADS=1
 STREAM_FPS=3
 CAPTURE_BUFFER_SIZE=4
 RTSP_CAPTURE_OPTIONS=rtsp_transport;tcp|max_delay;2000000|stimeout;10000000
-ALPR_CAPTURE_FPS=0.5
-ALPR_CAPTURE_WARMUP_SECONDS=1.5
-LIVE_STREAM_WARMUP_SECONDS=1.5
 HOST_DATA_DIR=/mnt/localdisk/pi-alpr
 APP_ENV_FILE=/mnt/localdisk/pi-alpr/config/.env
 DOCKER_LOG_DRIVER=none
@@ -213,13 +204,15 @@ Notes:
 - With the default `POSTBUFFER_SECONDS=5.0`, the image event keeps collecting frames for 5 seconds after motion stops.
 - The images page keeps only the newest `MAX_SAVED_IMAGES` JPG files, removes older frame artifacts automatically, and pages results so large image sets are not rendered all at once.
 - Event/test frame policy: crop to `PLATE_ROI` if set, run `fast-alpr`, and only send to OpenALPR if `fast-alpr` found a plate at or above `FAST_ALPR_MIN_CONFIDENCE`.
+- Manual video extraction writes image sets under `events/images/<camera_name>_video_extract_<timestamp>/`.
 
 ## Output
 
-Each event creates an image directory under `/mnt/localdisk/pi-alpr/events/images`, for example:
+Automatic event image extraction and manual video extraction create directories under `/mnt/localdisk/pi-alpr/events/images`, for example:
 
 ```text
 /mnt/localdisk/pi-alpr/events/images/home-driveway_20260409T120000Z/
+/mnt/localdisk/pi-alpr/events/images/home-driveway_video_extract_20260424T153044Z/
 ```
 
 Inside an event directory you will find:
@@ -229,13 +222,13 @@ Inside an event directory you will find:
 - `frame_01.json`, `frame_02.json`, ...
 - `summary.json`
 
-Longer motion-triggered MP4 recordings are stored separately under:
+Motion-triggered MP4 recordings and uploaded videos are stored separately under:
 
 ```text
 /mnt/localdisk/pi-alpr/events/videos/
 ```
 
-MP4 recordings are written through `ffmpeg` as H.264/yuv420p files and are first stored under `events/videos/recording-tmp/`. They move into the main videos directory only after the recording is closed cleanly.
+MP4 recordings are written locally on the Pi through `ffmpeg` as H.264/yuv420p files and are first stored under `events/videos/recording-tmp/`. They move into the main videos directory only after the recording is closed cleanly.
 
 Docker image layers and container metadata are controlled by the Docker daemon storage location, usually `/var/lib/docker`. Move Docker's `data-root` to `/mnt/localdisk` at the host level if those must also avoid the OS disk.
 

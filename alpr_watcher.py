@@ -45,7 +45,7 @@ from alpr_models import (
     parse_normalized_roi,
     redact_url_credentials,
 )
-from alpr_services import DirectRtspVideoRecorder, FfmpegVideoWriter, OpenAlprClient, QueuedVideoWriter
+from alpr_services import FfmpegVideoWriter, OpenAlprClient, QueuedVideoWriter
 
 
 class RtspVehicleWatcher:
@@ -55,7 +55,7 @@ class RtspVehicleWatcher:
         self.motion_zones = self._default_motion_zones()
         self._load_runtime_config()
         self.client = OpenAlprClient(config)
-        self.prebuffer: Deque[Tuple[float, Any]] = deque()
+        self.prebuffer: Deque[Tuple[float, Any]] = deque(maxlen=500)
         self.event: Optional[Event] = None
         self.motion_streak = 0
         self.last_motion_area = 0
@@ -67,6 +67,9 @@ class RtspVehicleWatcher:
         self.cumulative_zone_masks_by_id: dict[str, Any] = {}
         self.latest_motion_status = "Motion zones: waiting for activity"
         self.video_recording: Optional[VideoRecording] = None
+        self.last_video_recording: Optional[VideoRecording] = None
+        self.last_recording_ended_at: float = 0.0
+        self.extraction_status: dict[str, Any] = {}
         self.alpr_capture_session: Optional[AlprCaptureSession] = None
         self.alpr_capture_lock = threading.Lock()
         self.event_log_lock = threading.Lock()
@@ -78,16 +81,6 @@ class RtspVehicleWatcher:
         self.config.event_output_dir.mkdir(parents=True, exist_ok=True)
         self.config.image_output_dir.mkdir(parents=True, exist_ok=True)
         self.config.video_output_dir.mkdir(parents=True, exist_ok=True)
-        self.live_hls_root = self._prepare_live_hls_workspace()
-        self.live_hls_output_dir = self.live_hls_root / "hls"
-        self.live_hls_last_frame_at = 0.0
-        self.live_hls_stop = threading.Event()
-        self.live_hls_thread = threading.Thread(
-            target=self._live_hls_loop,
-            name="live-hls-stream",
-            daemon=True,
-        )
-        self.live_hls_thread.start()
         self.frame_lock = threading.Condition()
         self.latest_frame_jpeg: Optional[bytes] = None
         self.latest_clean_frame_jpeg: Optional[bytes] = None
@@ -454,7 +447,6 @@ class RtspVehicleWatcher:
                 logging.exception("Capture loop failed; reconnecting in 5 seconds")
                 time.sleep(5)
         self._stop_http_server()
-        self._stop_live_hls_stream()
         self._stop_stream_encoder()
 
     def _run_capture_loop(self) -> None:
@@ -541,7 +533,9 @@ class RtspVehicleWatcher:
 
                 self._push_prebuffer(timestamp, frame)
 
-                process_this_frame = self.frame_index % self.config.process_every_n_frames == 0
+                # During active recording, process fewer frames to free CPU for ffmpeg
+                process_interval = self.config.process_every_n_frames * 3 if self.video_recording is not None else self.config.process_every_n_frames
+                process_this_frame = self.frame_index % process_interval == 0
                 motion_area = self.last_motion_area
                 had_motion = False
                 triggered_zone_ids: Set[str] = set()
@@ -566,7 +560,7 @@ class RtspVehicleWatcher:
                         self.motion_streak = max(0, self.motion_streak - 1)
                         if self.motion_streak == 0:
                             self.last_triggered_zone_ids = set()
-                    should_accumulate_coverage = raw_motion or self.motion_streak > 0 or self.event is not None
+                    should_accumulate_coverage = raw_motion or self.motion_streak > 0
                     if should_accumulate_coverage:
                         (
                             zone_coverage_percent_by_id,
@@ -578,7 +572,9 @@ class RtspVehicleWatcher:
                     coverage_confirmed = bool(coverage_triggered_zone_ids)
                     if coverage_confirmed:
                         self.last_triggered_zone_ids.update(coverage_triggered_zone_ids)
-                    had_motion = self.motion_streak >= self.config.min_consecutive_hits or coverage_confirmed
+                    streak_confirmed = self.motion_streak >= self.config.min_consecutive_hits
+                    coverage_can_start_event = coverage_confirmed and self.event is None
+                    had_motion = streak_confirmed or coverage_can_start_event
                     self.last_motion_area = motion_area
                     self.last_motion_box = best_box
                     self.last_zone_area_by_id = dict(zone_area_by_id)
@@ -644,7 +640,6 @@ class RtspVehicleWatcher:
         finally:
             capture_stop.set()
             capture_thread.join(timeout=2.0)
-            self._stop_alpr_capture_session()
             self._stop_video_recording()
             self.capture.release()
 
@@ -788,10 +783,13 @@ class RtspVehicleWatcher:
     def _video_prebuffer_seconds(self) -> float:
         if self.config.prebuffer_frames > 0 and self.fps_guess > 0:
             return self.config.prebuffer_frames / max(self.fps_guess, 1.0)
-        return max(self.config.prebuffer_seconds, VIDEO_PREBUFFER_SECONDS)
+        return max(0.0, self.config.prebuffer_seconds)
 
     def _start_video_recording(self, timestamp: float, triggered_zone_ids: Set[str], confirmed: bool = False) -> None:
         if self.video_recording is not None:
+            return
+        cooldown = max(self.config.event_idle_seconds, 5.0)
+        if self.last_recording_ended_at > 0 and timestamp - self.last_recording_ended_at < cooldown:
             return
         vid_zone_id = self._primary_zone_id_for(triggered_zone_ids)
         record_seconds = self._record_seconds_for_zone_ids(triggered_zone_ids)
@@ -799,53 +797,10 @@ class RtspVehicleWatcher:
         stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         output_path = video_dir / f"{self.config.camera_name}_{stamp}.mp4"
         temp_output_path = self._video_temp_dir() / output_path.name
-        high_res_url = self._effective_alpr_rtsp_url()
-        use_direct_high_res_recorder = (
-            high_res_url
-            and high_res_url != self.config.rtsp_url
-            and shutil.which("ffmpeg")
-        )
-        if use_direct_high_res_recorder:
-            try:
-                transport = self._rtsp_option_value("rtsp_transport", "tcp") or "tcp"
-                writer = DirectRtspVideoRecorder(high_res_url, temp_output_path, transport, record_seconds)
-                self.video_recording = VideoRecording(
-                    started_at=timestamp,
-                    first_frame_at=timestamp,
-                    ends_at=timestamp + record_seconds,
-                    record_seconds=record_seconds,
-                    started_from_zone_ids=set(triggered_zone_ids),
-                    output_path=output_path,
-                    temp_output_path=temp_output_path,
-                    writer=writer,
-                    last_written_at=timestamp,
-                    frame_size=(0, 0),
-                    fps=0.0,
-                    source_url=high_res_url,
-                    confirmed=confirmed,
-                )
-                status = "confirmed motion" if confirmed else "motion warning"
-                logging.info(
-                    "Started %.0f-second 101 video recording at %s on %s for zones=%s",
-                    record_seconds,
-                    output_path,
-                    status,
-                    ",".join(sorted(triggered_zone_ids)) or "unknown",
-                )
-                self._add_event_log(
-                    "video",
-                    f"Started 101 video {output_path.name} for {int(round(record_seconds))}s on {status} for zones={','.join(sorted(triggered_zone_ids)) or 'unknown'}",
-                    zone_id=vid_zone_id,
-                )
-                return
-            except Exception:
-                temp_output_path.unlink(missing_ok=True)
-                logging.exception("Failed to start 101 video recording; falling back to motion stream frames")
-                self._add_event_log("video", "Failed to start 101 video; falling back to motion stream frames", zone_id=vid_zone_id)
         prebuffer_frames = [
             (frame_timestamp, frame_copy)
             for frame_timestamp, frame_copy in self.prebuffer
-            if frame_timestamp >= timestamp - VIDEO_PREBUFFER_SECONDS
+            if frame_timestamp >= timestamp - self._video_prebuffer_seconds()
         ]
         if len(prebuffer_frames) > MAX_VIDEO_PREBUFFER_FRAMES:
             last_index = len(prebuffer_frames) - 1
@@ -905,6 +860,7 @@ class RtspVehicleWatcher:
             last_written_at=last_written_at,
             frame_size=frame_size,
             fps=fps,
+            last_frame=self._prepare_video_frame(sample_frame, frame_size),
             source_url=self.config.rtsp_url,
             confirmed=confirmed,
         )
@@ -918,7 +874,7 @@ class RtspVehicleWatcher:
         )
         self._add_event_log(
             "video",
-            f"Started motion-stream video {output_path.name} for {int(round(record_seconds))}s on {status} for zones={','.join(sorted(triggered_zone_ids)) or 'unknown'}",
+            f"Started local video {output_path.name} for {int(round(record_seconds))}s on {status} for zones={','.join(sorted(triggered_zone_ids)) or 'unknown'}",
             zone_id=vid_zone_id,
         )
 
@@ -929,14 +885,19 @@ class RtspVehicleWatcher:
         if timestamp > recording.ends_at:
             self._stop_video_recording()
             return
-        if recording.source_url and recording.source_url != self.config.rtsp_url:
-            return
         min_frame_interval = 1.0 / recording.fps
-        if timestamp <= recording.last_written_at or timestamp - recording.last_written_at < min_frame_interval:
+        if timestamp <= recording.last_written_at:
             return
         prepared_frame = self._prepare_video_frame(frame, recording.frame_size)
-        recording.writer.write(prepared_frame)
-        recording.last_written_at = timestamp
+        elapsed = timestamp - recording.last_written_at
+        frames_to_write = max(1, int(round(elapsed / min_frame_interval)))
+        frames_to_write = min(frames_to_write, max(1, int(recording.fps * 5)))
+        for _ in range(frames_to_write):
+            recording.writer.write(prepared_frame)
+        recording.last_written_at += frames_to_write * min_frame_interval
+        if recording.last_written_at > timestamp:
+            recording.last_written_at = timestamp
+        recording.last_frame = prepared_frame
 
     def _stop_video_recording(self) -> None:
         recording = self.video_recording
@@ -949,6 +910,8 @@ class RtspVehicleWatcher:
             release_error = exc
         finally:
             self.video_recording = None
+            self.last_video_recording = recording
+            self.last_recording_ended_at = time.time()
         rec_zone_id = self._primary_zone_id_for(recording.started_from_zone_ids)
         if release_error:
             if not self._video_file_is_readable(recording.temp_output_path):
@@ -1020,34 +983,7 @@ class RtspVehicleWatcher:
         self._stop_video_recording()
 
     def _start_alpr_capture_session(self, timestamp: float, confirmed: bool = False) -> None:
-        high_res_url = self._effective_alpr_rtsp_url()
-        if not high_res_url or high_res_url == self.config.rtsp_url:
-            return
-        with self.alpr_capture_lock:
-            session = self.alpr_capture_session
-            if session is not None:
-                if confirmed and not session.confirmed:
-                    session.confirmed = True
-                    logging.info("Confirmed high-resolution ALPR sampler for active motion event")
-                return
-            stop_event = threading.Event()
-            frames: Deque[CandidateFrame] = deque(maxlen=max(self.config.upload_top_frames * 2, 30))
-            thread = threading.Thread(
-                target=self._run_alpr_capture_session,
-                args=(stop_event, frames),
-                name="alpr-rtsp-101-sampler",
-                daemon=True,
-            )
-            self.alpr_capture_session = AlprCaptureSession(
-                started_at=timestamp,
-                stop_event=stop_event,
-                thread=thread,
-                frames=frames,
-                confirmed=confirmed,
-            )
-            thread.start()
-        status = "confirmed motion" if confirmed else "motion warning"
-        logging.info("Started high-resolution ALPR sampler from %s on %s", redact_url_credentials(high_res_url), status)
+        return
 
     def _run_alpr_capture_session(self, stop_event: threading.Event, frames: Deque[CandidateFrame]) -> None:
         if shutil.which("ffmpeg") and self._effective_alpr_rtsp_url():
@@ -1262,16 +1198,13 @@ class RtspVehicleWatcher:
         logging.info("Discarded high-resolution ALPR sampler after motion warning cleared")
 
     def _uses_high_res_image_stream(self) -> bool:
-        high_res_url = self._effective_alpr_rtsp_url()
-        return bool(high_res_url and high_res_url != self.config.rtsp_url)
+        return False
 
     def _effective_alpr_rtsp_url(self) -> str:
-        if self.config.alpr_rtsp_url:
-            return self.config.alpr_rtsp_url
-        return self._derive_hikvision_101_url(self.config.rtsp_url)
+        return self.config.rtsp_url
 
     def _derive_hikvision_101_url(self, rtsp_url: str) -> str:
-        return re.sub(r"(?i)(/Streaming/Channels/)102\b", r"\g<1>101", rtsp_url)
+        return rtsp_url
 
     def _rtsp_option_value(self, name: str, default: str = "") -> str:
         parts = [part.strip() for part in self.config.rtsp_capture_options.split("|") if part.strip()]
@@ -1328,13 +1261,13 @@ class RtspVehicleWatcher:
                 {
                     "camera_name": self.config.camera_name,
                     "video_path": str(recording.output_path),
-                    "source": "101" if recording.source_url and recording.source_url != self.config.rtsp_url else "motion-stream",
+                    "source": "capture-stream",
                     "started_at_epoch": recording.started_at,
                     "first_frame_at_epoch": recording.first_frame_at,
                     "ends_at_epoch": recording.ends_at,
                     "zone_ids": sorted(recording.started_from_zone_ids),
                     "event_count": len(recording.pending_events),
-                    "prebuffer_seconds": VIDEO_PREBUFFER_SECONDS,
+                    "prebuffer_seconds": self._video_prebuffer_seconds(),
                     "recording_seconds": recording.record_seconds,
                 },
                 indent=2,
@@ -1343,8 +1276,8 @@ class RtspVehicleWatcher:
 
     def _prebuffer_frame_limit(self) -> int:
         if self.config.prebuffer_frames > 0:
-            return max(self.config.prebuffer_frames, int(self.fps_guess * VIDEO_PREBUFFER_SECONDS))
-        return int(self.fps_guess * max(self.config.prebuffer_seconds, VIDEO_PREBUFFER_SECONDS))
+            return self.config.prebuffer_frames
+        return int(self.fps_guess * max(0.1, self.config.prebuffer_seconds))
 
     def _postbuffer_frame_limit(self) -> int:
         if self.config.postbuffer_frames > 0:
@@ -1430,15 +1363,6 @@ class RtspVehicleWatcher:
                 continue
             zone_x1, zone_y1, zone_x2, zone_y2 = self._zone_bounds(frame, zone)
             cv2.rectangle(frame, (zone_x1, zone_y1), (zone_x2, zone_y2), zone.overlay_bgr, 2)
-            cv2.putText(
-                frame,
-                zone.label.lower(),
-                (zone_x1 + 6, max(24, zone_y1 - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                zone.overlay_bgr,
-                2,
-            )
         return frame
 
     def _detect_motion(
@@ -1582,13 +1506,13 @@ class RtspVehicleWatcher:
             recording.started_from_zone_ids.update(triggered_zone_ids)
             recording.ends_at = max(recording.ends_at, timestamp + self._record_seconds_for_zone_ids(self.event.zones_triggered))
             recording.record_seconds = max(recording.record_seconds, recording.ends_at - recording.started_at)
-        self.event.candidates.append(candidate)
+        self.event.append_candidate(candidate)
         self._append_event_frame(timestamp, frame, count_as_postbuffer=False)
 
     def _append_event_frame(self, timestamp: float, frame, count_as_postbuffer: bool) -> None:
         if not self.event:
             return
-        self.event.frames.append((timestamp, frame.copy()))
+        self.event.append_frame(timestamp, frame.copy())
         self.event.last_frame_at = timestamp
         if count_as_postbuffer:
             self.event.frames_since_motion += 1
@@ -1609,6 +1533,7 @@ class RtspVehicleWatcher:
         detected_at_epoch: float,
         enable_alpr: bool = True,
         jpeg_bytes: Optional[bytes] = None,
+        source_label: Optional[str] = None,
         zone_ids: Optional[Set[str]] = None,
     ) -> dict[str, Any]:
         frame_path = event_dir / f"{base_name}.jpg"
@@ -1619,7 +1544,7 @@ class RtspVehicleWatcher:
         if jpeg_bytes is None or frame_to_save is not frame:
             jpeg_bytes = self._encode_jpeg(frame_to_save)
         frame_path.write_bytes(jpeg_bytes)
-        source = "alpr-rtsp" if frame is not None and self._uses_high_res_image_stream() else "capture"
+        source = source_label or ("alpr-rtsp" if frame is not None and self._uses_high_res_image_stream() else "capture")
         (event_dir / f"{base_name}.meta.json").write_text(
             json.dumps({"source": source, "detected_at_epoch": detected_at_epoch}, indent=2)
         )
@@ -1773,18 +1698,37 @@ class RtspVehicleWatcher:
             return
         event = self.event
         self.event = None
+        high_res_candidates = self._stop_alpr_capture_session()
+        if high_res_candidates:
+            for candidate in high_res_candidates:
+                event.append_candidate(candidate)
+            logging.info("Attached %s high-resolution ALPR frames to finalized event", len(high_res_candidates))
         logging.info("Closing event: %s", reason)
         zone_id = self._primary_zone_id_for(event.zones_triggered)
         self._add_event_log("motion", f"Closed motion event: {reason}", zone_id=zone_id)
-        recording = self.video_recording
-        # Only queue to the recording if it hasn't been finalized yet (output doesn't exist yet)
-        if recording is not None and recording.confirmed and not recording.output_path.exists():
+        if not self._event_uses_fast_alpr(event):
+            self._add_event_log(
+                "image",
+                "Skipped automatic image creation because Send to ALPR is disabled for the triggered zone",
+                zone_id=zone_id,
+            )
+            return
+        recording = self.video_recording or self.last_video_recording
+        if recording is not None and recording.confirmed:
             recording.pending_events.append(event)
             logging.info(
                 "Queued event for frame extraction after video %s is finalized",
                 recording.output_path,
             )
             self._add_event_log("image", f"Queued image extraction after video {recording.output_path.name} closes", zone_id=zone_id)
+            if self.video_recording is None:
+                self.last_video_recording = None
+                thread = threading.Thread(
+                    target=self._save_video_events,
+                    args=(recording,),
+                    daemon=True,
+                )
+                thread.start()
             return
         thread = threading.Thread(
             target=self._save_finalized_event,
@@ -1809,6 +1753,7 @@ class RtspVehicleWatcher:
                     "video finalized",
                     source_video_path=recording.output_path,
                     source_video_first_frame_at=recording.first_frame_at,
+                    source_video_ends_at=recording.ends_at,
                 )
             except Exception:
                 logging.exception("Failed to extract event images from %s", recording.output_path)
@@ -1820,6 +1765,7 @@ class RtspVehicleWatcher:
         reason: str,
         source_video_path: Optional[Path] = None,
         source_video_first_frame_at: Optional[float] = None,
+        source_video_ends_at: Optional[float] = None,
     ) -> None:
         event_zone_id = self._primary_zone_id_for(event.zones_triggered)
         if event.trigger_count < self.config.min_consecutive_hits:
@@ -1837,16 +1783,30 @@ class RtspVehicleWatcher:
         event_dir.mkdir(parents=True, exist_ok=True)
         image_limit = self._image_limit_for_zone_ids(event.zones_triggered)
         event_start_at = event.frames[0][0] if event.frames else event.started_at
+        event_end_at = source_video_ends_at if source_video_ends_at else event.last_frame_at
         selected: List[CandidateFrame] = []
+        high_res_candidates = [
+            candidate
+            for candidate in event.candidates
+            if candidate.frame is not None and candidate.source == "alpr-rtsp"
+        ]
+        if high_res_candidates:
+            selected.extend(self._select_timeline_candidates(high_res_candidates, image_limit))
         if source_video_path is not None and source_video_first_frame_at is not None:
-            selected = self._extract_video_event_candidates(
-                source_video_path,
-                source_video_first_frame_at,
-                event_start_at,
-                event.last_frame_at,
-                event,
-                image_limit,
-            )
+            remaining = max(0, image_limit - len(selected))
+            if remaining > 0:
+                selected.extend(
+                    self._extract_video_event_candidates(
+                        source_video_path,
+                        source_video_first_frame_at,
+                        event_start_at,
+                        event_end_at,
+                        event,
+                        remaining,
+                    )
+                )
+        if selected:
+            selected = self._select_timeline_candidates(selected, image_limit)
         if not selected:
             selected = self._fallback_event_candidates(event, image_limit)
             if selected:
@@ -1880,6 +1840,7 @@ class RtspVehicleWatcher:
                 candidate.timestamp,
                 enable_alpr=alpr_enabled,
                 jpeg_bytes=candidate.jpeg_bytes,
+                source_label=candidate.source,
                 zone_ids=candidate.zone_ids,
             )
             fast_alpr_results.extend(pipeline["fast_alpr_results"])
@@ -2052,6 +2013,47 @@ class RtspVehicleWatcher:
             )
         return fallback_candidates
 
+    def _extract_local_video_frame_with_ffmpeg(self, video_path: Path, position_seconds: float):
+        if not shutil.which("ffmpeg"):
+            return None
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-ss",
+                    f"{max(0.0, position_seconds):.3f}",
+                    "-i",
+                    str(video_path),
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "image2pipe",
+                    "-vcodec",
+                    "mjpeg",
+                    "pipe:1",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+            )
+        except subprocess.TimeoutExpired:
+            logging.warning(
+                "Timed out extracting frame at %.3fs from %s with ffmpeg",
+                position_seconds,
+                video_path,
+            )
+            return None
+        if result.returncode != 0:
+            return None
+        for jpeg_bytes in self._iter_jpeg_frames(result.stdout):
+            frame = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame is not None:
+                return frame
+        return None
+
     def _extract_video_event_candidates(
         self,
         video_path: Path,
@@ -2074,6 +2076,28 @@ class RtspVehicleWatcher:
             f"Sampling {len(target_timestamps)} image timestamps from local video {video_path.name}",
             zone_id=event_zone_id,
         )
+        if shutil.which("ffmpeg"):
+            candidates: List[CandidateFrame] = []
+            for frame_timestamp in target_timestamps:
+                position_seconds = max(0.0, frame_timestamp - first_frame_at)
+                frame = self._extract_local_video_frame_with_ffmpeg(video_path, position_seconds)
+                if frame is None:
+                    logging.warning("Unable to extract video frame at %.3fs from %s using ffmpeg", position_seconds, video_path)
+                    self._add_event_log("image", f"Could not extract frame at {position_seconds:.3f}s from {video_path.name}", zone_id=event_zone_id)
+                    continue
+                candidates.append(
+                    CandidateFrame(
+                        frame=frame.copy(),
+                        timestamp=frame_timestamp,
+                        motion_area=0,
+                        sharpness=self._compute_sharpness(self._plate_crop(frame, zone_ids=event.zones_triggered)),
+                        jpeg_bytes=self._encode_jpeg(frame),
+                        source="video",
+                        zone_ids=set(event.zones_triggered),
+                    )
+                )
+            self._add_event_log("image", f"Extracted {len(candidates)} frames from local video {video_path.name}", zone_id=event_zone_id)
+            return candidates
         capture = cv2.VideoCapture(str(video_path))
         if not capture.isOpened():
             logging.warning("Unable to open saved video for frame extraction: %s", video_path)
@@ -2271,7 +2295,9 @@ class RtspVehicleWatcher:
 
     def _update_latest_frames(self, display_frame, source_frame) -> None:
         now = time.time()
-        min_interval = 1.0 / self.config.stream_fps
+        # Throttle stream to 1 FPS during active recording to free CPU for ffmpeg
+        effective_fps = 1.0 if self.video_recording is not None else self.config.stream_fps
+        min_interval = 1.0 / max(1.0, effective_fps)
         if self.latest_frame_jpeg is not None and now - self.last_stream_encode_enqueued_at < min_interval:
             return
         self.last_stream_encode_enqueued_at = now
@@ -2356,9 +2382,6 @@ class RtspVehicleWatcher:
                 if path == "/test":
                     self._send_html(watcher._render_test_page())
                     return
-                if path == "/live":
-                    self._send_html(watcher._render_live_page())
-                    return
                 if path == "/stats":
                     self._send_html(watcher._render_stats_page())
                     return
@@ -2374,20 +2397,17 @@ class RtspVehicleWatcher:
                 if path == "/api/event-log":
                     self._send_json({"events": watcher._event_log_snapshot()})
                     return
+                if path == "/api/extraction-status":
+                    self._send_json(watcher.extraction_status)
+                    return
                 if path == "/api/telegram/settings":
                     self._send_json(watcher._telegram_settings_for_ui())
-                    return
-                if path.startswith("/live-hls/"):
-                    watcher._serve_live_hls_file(self, path[len("/live-hls/"):])
                     return
                 if path == "/stream.mjpg":
                     self._send_mjpeg_stream()
                     return
                 if path == "/stream-clean.mjpg":
                     self._send_mjpeg_stream(clean=True)
-                    return
-                if path == "/live.mjpg":
-                    self._send_direct_mjpeg_stream(watcher._effective_alpr_rtsp_url() or watcher.config.rtsp_url)
                     return
                 if path == "/plate-zone.mjpg":
                     self._send_mjpeg_stream(plate_zoom=True)
@@ -2421,9 +2441,6 @@ class RtspVehicleWatcher:
 
             def do_HEAD(self) -> None:
                 path = unquote(self.path.split("?", 1)[0])
-                if path.startswith("/live-hls/"):
-                    watcher._serve_live_hls_file(self, path[len("/live-hls/"):], head_only=True)
-                    return
                 if path.startswith("/events/"):
                     watcher._serve_event_file(self, path[len("/events/"):], head_only=True)
                     return
@@ -2472,6 +2489,9 @@ class RtspVehicleWatcher:
                     return
                 if path == "/api/videos/quick-alpr":
                     watcher._handle_video_quick_alpr(self)
+                    return
+                if path == "/api/videos/upload":
+                    watcher._handle_video_upload(self)
                     return
                 if path == "/test":
                     watcher._handle_test_upload(self)
@@ -2664,7 +2684,7 @@ class RtspVehicleWatcher:
         self.http_thread = threading.Thread(target=self.http_server.serve_forever, daemon=True)
         self.http_thread.start()
         logging.info(
-            "Web UI available at http://127.0.0.1:%s/ live=http://127.0.0.1:%s/live stats=http://127.0.0.1:%s/stats images=http://127.0.0.1:%s/images",
+            "Web UI available at http://127.0.0.1:%s/ stats=http://127.0.0.1:%s/stats images=http://127.0.0.1:%s/images videos=http://127.0.0.1:%s/videos",
             self.config.web_port,
             self.config.web_port,
             self.config.web_port,
@@ -3280,6 +3300,12 @@ a { color: #7dd3fc; }
 .menu-actions form { margin: 0; }
 .menu-actions button { color: #fee2e2; text-decoration: none; border: 1px solid #7f1d1d; border-radius: 8px; padding: 8px 11px; background: #450a0a; line-height: 1; cursor: pointer; font: inherit; }
 .menu-actions button:hover { border-color: #fca5a5; color: #fff; background: #7f1d1d; }
+.menu-actions button.confirm-armed { border-color: #facc15; color: #111827; background: #facc15; }
+.menu-icon-button { display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: 999px; border: 1px solid #334155; background: transparent; color: #cbd5e1; cursor: pointer; padding: 0; }
+.menu-icon-button:hover { border-color: #facc15; color: #facc15; background: #172033; }
+.menu-icon-button.danger { border-color: #7f1d1d; color: #fca5a5; background: #450a0a; }
+.menu-icon-button.danger:hover { border-color: #fca5a5; color: #fff; background: #7f1d1d; }
+.menu-icon-button.confirm-armed { border-color: #facc15; color: #111827; background: #facc15; }
 .menu-actions button.view-button { color: #cde8de; border-color: #2f514b; background: #10211f; }
 .menu-actions button.view-button:hover { border-color: #5eead4; color: #f8fafc; background: #17302d; }
 .menu-actions button.view-button.active { border-color: #facc15; color: #111827; background: #facc15; font-weight: 700; }
@@ -3299,7 +3325,6 @@ h1 { margin-top: 0; }
     def _render_nav(self, active: str) -> str:
         items = [
             ("dashboard", "/", "Dashboard"),
-            ("live", "/live", "Live"),
             ("stats", "/stats", "Config"),
             ("images", "/images", "Images"),
             ("videos", "/videos", "Videos"),
@@ -3311,10 +3336,23 @@ h1 { margin-top: 0; }
             for item_id, href, label in items
         )
         action_by_page = {
-            "live": '<button class="view-button active" id="live-horizontal" type="button" aria-pressed="true">Horizontal</button><button class="view-button" id="live-vertical" type="button" aria-pressed="false">Vertical</button>',
-            "images": '<form method="post" action="/api/images/clear" onsubmit="return confirm(\'Remove all saved images?\');"><button type="submit">Remove Images</button></form>',
-            "videos": '<form method="post" action="/api/videos/clear" onsubmit="return confirm(\'Remove all saved videos?\');"><button type="submit">Remove Videos</button></form>',
-            "plates": '<form method="post" action="/api/plates/clear" onsubmit="return confirm(\'Remove all detected plates? Images and videos will stay saved.\');"><button type="submit">Remove Plates</button></form>',
+            "images": (
+                '<form method="post" action="/api/images/clear" data-double-confirm="Remove Images" style="margin:0;">'
+                '<button class="menu-icon-button danger" type="submit" aria-label="Remove all images" title="Remove all images">'
+                '<svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor;"><path d="M9 3h6l1 2h5v2H3V5h5l1-2Zm1 6h2v8h-2V9Zm4 0h2v8h-2V9ZM6 9h2v8H6V9Zm1 12a2 2 0 0 1-2-2V8h14v11a2 2 0 0 1-2 2H7Z"/></svg>'
+                '</button></form>'
+            ),
+            "videos": (
+                '<button class="menu-icon-button" id="video-upload-btn" type="button" aria-label="Upload video" title="Upload video">'
+                '<svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor;"><path d="M11 16V7.85l-2.6 2.6L7 9l5-5 5 5-1.4 1.45-2.6-2.6V16h-2Zm-5 4q-.825 0-1.413-.588T4 18v-3h2v3h12v-3h2v3q0 .825-.588 1.413T18 20H6Z"/></svg>'
+                '</button>'
+                '<input type="file" id="video-upload-input" accept="video/mp4,video/*,.mp4,.mov,.avi" style="display:none;">'
+                '<form id="video-clear-form" method="post" action="/api/videos/clear" style="margin:0;" data-double-confirm="Remove Videos">'
+                '<button class="menu-icon-button danger" type="submit" aria-label="Remove all videos" title="Remove all videos">'
+                '<svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor;"><path d="M9 3h6l1 2h5v2H3V5h5l1-2Zm1 6h2v8h-2V9Zm4 0h2v8h-2V9ZM6 9h2v8H6V9Zm1 12a2 2 0 0 1-2-2V8h14v11a2 2 0 0 1-2 2H7Z"/></svg>'
+                '</button></form>'
+            ),
+            "plates": '<form method="post" action="/api/plates/clear" data-double-confirm="Remove Plates"><button type="submit">Remove Plates</button></form>',
         }
         action = action_by_page.get(active, "")
         actions = f'<div class="menu-actions" aria-label="Page actions">{action}</div>' if action else ""
@@ -3352,6 +3390,141 @@ h1 { margin-top: 0; }
   syncClockDisplay();
   setInterval(renderClock, 1000);
   setInterval(syncClockDisplay, 30000);
+}})();
+
+(() => {{
+  const uploadBtn = document.getElementById('video-upload-btn');
+  const uploadInput = document.getElementById('video-upload-input');
+  const doubleConfirmForms = Array.from(document.querySelectorAll('form[data-double-confirm]'));
+
+  function armDoubleConfirm(form) {{
+    const button = form && form.querySelector('button[type="submit"], button:not([type])');
+    if (!button) return;
+    button.classList.add('confirm-armed');
+    form.dataset.confirmArmed = 'true';
+  }}
+
+  function resetDoubleConfirm(form) {{
+    const button = form && form.querySelector('button[type="submit"], button:not([type])');
+    if (!button) return;
+    button.classList.remove('confirm-armed');
+    delete form.dataset.confirmArmed;
+  }}
+
+  doubleConfirmForms.forEach((form) => {{
+    const button = form.querySelector('button[type="submit"], button:not([type])');
+    if (!button) return;
+    form.addEventListener('submit', (event) => {{
+      if (form.dataset.confirmArmed === 'true') return;
+      event.preventDefault();
+      doubleConfirmForms.forEach((otherForm) => {{
+        if (otherForm !== form) resetDoubleConfirm(otherForm);
+      }});
+      armDoubleConfirm(form);
+    }});
+    button.addEventListener('blur', () => {{
+      window.setTimeout(() => {{
+        if (!form.contains(document.activeElement)) resetDoubleConfirm(form);
+      }}, 0);
+    }});
+  }});
+
+  if (uploadBtn && uploadInput) {{
+    uploadBtn.addEventListener('click', () => uploadInput.click());
+    uploadInput.addEventListener('change', () => {{
+      const file = uploadInput.files && uploadInput.files[0];
+      if (!file) return;
+      uploadInput.value = '';
+      const overlay = document.getElementById('action-overlay');
+      const title = document.getElementById('action-title');
+      const message = document.getElementById('action-message');
+      const spinner = document.getElementById('action-spinner');
+      const close = document.getElementById('action-close');
+      const progress = document.getElementById('action-progress');
+      const progressBar = document.getElementById('action-progress-bar');
+      const progressText = document.getElementById('action-progress-text');
+      function showOverlay(heading, detail, finished) {{
+        if (!overlay || !title || !message || !spinner || !close) return;
+        title.textContent = heading;
+        message.textContent = detail;
+        overlay.classList.add('visible');
+        spinner.style.display = finished ? 'none' : 'block';
+        close.style.display = finished ? 'inline-flex' : 'none';
+      }}
+      function showUploadProgress(loaded, total) {{
+        if (!progress || !progressBar || !progressText) return;
+        progress.style.display = 'block';
+        progressText.style.display = 'block';
+        if (total > 0) {{
+          const percent = Math.max(0, Math.min(100, Math.round((loaded / total) * 100)));
+          progressBar.style.width = `${{percent}}%`;
+          progressText.textContent = `${{percent}}% • ${{
+            (loaded / (1024 * 1024)).toFixed(1)
+          }} / ${{(total / (1024 * 1024)).toFixed(1)}} MB`;
+        }} else {{
+          progressBar.style.width = '100%';
+          progressText.textContent = `${{(loaded / (1024 * 1024)).toFixed(1)}} MB uploaded`;
+        }}
+      }}
+      function showProcessingState(detail) {{
+        if (!progress || !progressBar || !progressText) return;
+        progress.style.display = 'block';
+        progressText.style.display = 'block';
+        progressBar.style.width = '100%';
+        progressText.textContent = 'Upload finished. Waiting for server response...';
+        if (message) message.textContent = detail;
+      }}
+      function hideUploadProgress() {{
+        if (!progress || !progressBar || !progressText) return;
+        progress.style.display = 'none';
+        progressText.style.display = 'none';
+        progressBar.style.width = '0%';
+        progressText.textContent = '0%';
+      }}
+      showOverlay('Uploading...', file.name, false);
+      showUploadProgress(0, file.size || 0);
+      const form = new FormData();
+      form.append('video', file, file.name);
+      const request = new XMLHttpRequest();
+      request.open('POST', '/api/videos/upload');
+      request.responseType = 'json';
+      request.upload.addEventListener('progress', (event) => {{
+        if (event.lengthComputable) showUploadProgress(event.loaded, event.total);
+      }});
+      request.upload.addEventListener('load', () => {{
+        showProcessingState('Upload completed. Saving video on the server...');
+      }});
+      request.addEventListener('load', () => {{
+        const payload = request.response && typeof request.response === 'object'
+          ? request.response
+          : (() => {{
+              try {{
+                return JSON.parse(request.responseText || '{{}}');
+              }} catch (error) {{
+                return {{}};
+              }}
+            }})();
+        if (request.status >= 200 && request.status < 300) {{
+          showUploadProgress(file.size || 0, file.size || 0);
+          showOverlay('Uploaded', payload.message || 'Video uploaded successfully.', true);
+          if (close) close.addEventListener('click', () => window.location.reload(), {{ once: true }});
+          return;
+        }}
+        hideUploadProgress();
+        showOverlay('Upload failed', payload.error || 'Upload did not complete.', true);
+      }});
+      request.addEventListener('error', () => {{
+        hideUploadProgress();
+        showOverlay('Upload failed', 'Upload did not complete.', true);
+      }});
+      request.addEventListener('abort', () => {{
+        hideUploadProgress();
+        showOverlay('Upload canceled', file.name, true);
+      }});
+      request.send(form);
+    }});
+  }}
+
 }})();
 </script>"""
 
@@ -3947,13 +4120,16 @@ a {{ color: #93c5fd; }}
 .video-subtle {{ margin: 6px 0 0; color: #94a3b8; font-size: 0.92rem; }}
 .video-badges {{ display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }}
 .video-chip {{ display: inline-flex; align-items: center; min-height: 28px; padding: 0 10px; border-radius: 999px; background: rgba(30, 41, 59, 0.92); color: #cbd5e1; font-size: 0.82rem; border: 1px solid #334155; }}
-.video-actions {{ display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }}
+.video-actions {{ display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; align-items: flex-start; }}
 .video-actions a {{ text-decoration: none; }}
 .video-icon-form {{ margin: 0; }}
+.video-action-slot {{ display: inline-flex; flex-direction: column; align-items: center; justify-content: flex-start; width: 34px; gap: 6px; }}
 .video-icon-button {{ display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 999px; border: 1px solid #334155; background: transparent; color: #cbd5e1; cursor: pointer; padding: 0; }}
 .video-icon-button svg {{ width: 18px; height: 18px; fill: currentColor; display: block; }}
 .video-icon-button:hover {{ border-color: #facc15; color: #facc15; background: #172033; }}
 .video-icon-button.danger:hover {{ border-color: #f87171; color: #f87171; background: #2b1520; }}
+.video-icon-button.busy {{ border-color: #38bdf8; color: #38bdf8; background: #0f172a; }}
+.video-action-status {{ min-height: 10px; color: #38bdf8; font-size: 0.68rem; font-variant-numeric: tabular-nums; line-height: 1; text-align: center; white-space: nowrap; }}
 .player-card {{ position: sticky; top: 18px; }}
 .eyebrow {{ display: inline-flex; align-items: center; gap: 8px; color: #facc15; font-size: 0.78rem; letter-spacing: 0.16em; text-transform: uppercase; }}
 .eyebrow::before {{ content: ""; width: 26px; height: 1px; background: currentColor; opacity: 0.8; }}
@@ -3974,6 +4150,9 @@ a {{ color: #93c5fd; }}
 .action-overlay-card {{ min-width: min(92vw, 360px); max-width: 420px; background: #111827; border: 1px solid #334155; border-radius: 18px; padding: 22px; text-align: center; box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35); }}
 .action-overlay-card p {{ margin: 10px 0 0; color: #cbd5e1; }}
 .action-spinner {{ width: 34px; height: 34px; margin: 0 auto; border-radius: 999px; border: 3px solid #334155; border-top-color: #facc15; animation: spin 0.9s linear infinite; }}
+.action-progress {{ width: 100%; height: 12px; margin-top: 14px; border-radius: 999px; background: #1f2937; border: 1px solid #334155; overflow: hidden; display: none; }}
+.action-progress-bar {{ width: 0%; height: 100%; background: linear-gradient(90deg, #facc15, #fb7185); transition: width 0.12s ease-out; }}
+.action-progress-text {{ margin-top: 10px; color: #facc15; font-variant-numeric: tabular-nums; display: none; }}
 .action-overlay-close {{ margin-top: 14px; background: #facc15; color: #111827; border: 0; border-radius: 8px; padding: 9px 14px; cursor: pointer; font-weight: 700; display: none; }}
 @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
 .pagination {{ display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 18px 0; }}
@@ -3990,7 +4169,7 @@ p {{ margin: 8px 0 0; word-break: break-word; }}
 <div class="hero"><div><h1>Videos</h1><p>A cleaner browser for reviewing clips and running quick actions.</p></div></div>
 {summary}
 {pagination}
-<div class="stack">{gallery}</div>
+{gallery}
 {pagination}
 </div>
 <div id="action-overlay" class="action-overlay" aria-live="polite" aria-busy="true">
@@ -3998,6 +4177,8 @@ p {{ margin: 8px 0 0; word-break: break-word; }}
     <div id="action-spinner" class="action-spinner"></div>
     <h2 id="action-title">Working...</h2>
     <p id="action-message">Please wait while the action finishes.</p>
+    <div id="action-progress" class="action-progress"><div id="action-progress-bar" class="action-progress-bar"></div></div>
+    <div id="action-progress-text" class="action-progress-text">0%</div>
     <button id="action-close" class="action-overlay-close" type="button">Close</button>
   </div>
 </div>
@@ -4699,16 +4880,18 @@ a {{ color: #93c5fd; }}
             result_path = image_path.with_name(f"{image_path.stem}.manual_fast_alpr.json")
             result_path.write_text(json.dumps(result, indent=2))
             relative = self._relative_image_path(image_path)
-            body = self._render_saved_image_fast_alpr_result_page(relative, result, result_path).encode("utf-8")
+            detections = self._extract_fast_alpr_detections(result, relative, image_path.parent.name, time.time())
+            plates_text = ", ".join(f"{d.plate} ({d.confidence:.2f})" for d in detections) or "No plates detected"
+            body = json.dumps({"ok": True, "message": f"ALPR: {plates_text}"}).encode("utf-8")
             handler.send_response(HTTPStatus.OK)
-            handler.send_header("Content-Type", "text/html; charset=utf-8")
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
             handler.send_header("Content-Length", str(len(body)))
             handler.end_headers()
             handler.wfile.write(body)
         except Exception as exc:
-            body = self._render_saved_image_fast_alpr_error_page(str(exc)).encode("utf-8")
+            body = json.dumps({"error": str(exc)}).encode("utf-8")
             handler.send_response(HTTPStatus.BAD_REQUEST)
-            handler.send_header("Content-Type", "text/html; charset=utf-8")
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
             handler.send_header("Content-Length", str(len(body)))
             handler.end_headers()
             handler.wfile.write(body)
@@ -4829,16 +5012,18 @@ a {{ color: #93c5fd; }}
             result_path = image_path.with_name(f"{image_path.stem}.manual_fast_alpr.json")
             result_path.write_text(json.dumps(result, indent=2))
             relative = self._relative_image_path(image_path)
-            body = self._render_saved_image_fast_alpr_result_page(relative, result, result_path).encode("utf-8")
+            detections = self._extract_fast_alpr_detections(result, relative, image_path.parent.name, time.time())
+            plates_text = ", ".join(f"{d.plate} ({d.confidence:.2f})" for d in detections) or "No plates detected"
+            body = json.dumps({"ok": True, "message": f"ALPR: {plates_text}"}).encode("utf-8")
             handler.send_response(HTTPStatus.OK)
-            handler.send_header("Content-Type", "text/html; charset=utf-8")
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
             handler.send_header("Content-Length", str(len(body)))
             handler.end_headers()
             handler.wfile.write(body)
         except Exception as exc:
-            body = self._render_saved_image_fast_alpr_error_page(str(exc)).encode("utf-8")
+            body = json.dumps({"error": str(exc)}).encode("utf-8")
             handler.send_response(HTTPStatus.BAD_REQUEST)
-            handler.send_header("Content-Type", "text/html; charset=utf-8")
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
             handler.send_header("Content-Length", str(len(body)))
             handler.end_headers()
             handler.wfile.write(body)
@@ -4850,7 +5035,38 @@ a {{ color: #93c5fd; }}
             return max(0.0, frame_count / fps)
         return 0.0
 
-    def _saved_video_duration_seconds(self, video_path: Path, metadata: Optional[dict] = None) -> float:
+    def _video_duration_seconds_with_ffprobe(self, video_path: Path) -> float:
+        if not shutil.which("ffprobe"):
+            return 0.0
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(video_path),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                text=True,
+            )
+            if result.returncode != 0:
+                return 0.0
+            return max(0.0, float((result.stdout or "").strip() or 0.0))
+        except Exception:
+            return 0.0
+
+    def _saved_video_duration_seconds(
+        self,
+        video_path: Path,
+        metadata: Optional[dict] = None,
+        allow_probe: bool = True,
+    ) -> float:
         if metadata:
             try:
                 recording_seconds = float(metadata.get("recording_seconds") or 0.0)
@@ -4858,6 +5074,11 @@ a {{ color: #93c5fd; }}
                     return recording_seconds
             except (TypeError, ValueError):
                 pass
+        probed_duration = self._video_duration_seconds_with_ffprobe(video_path)
+        if probed_duration > 0:
+            return probed_duration
+        if not allow_probe:
+            return 0.0
         capture = cv2.VideoCapture(str(video_path))
         if not capture.isOpened():
             return 0.0
@@ -4866,7 +5087,40 @@ a {{ color: #93c5fd; }}
         finally:
             capture.release()
 
+    def _load_or_create_video_metadata(self, video_path: Path) -> dict:
+        metadata_path = video_path.with_suffix(".json")
+        metadata: dict[str, Any] = {}
+        if metadata_path.exists():
+            try:
+                loaded = json.loads(metadata_path.read_text())
+                if isinstance(loaded, dict):
+                    metadata = loaded
+            except Exception:
+                logging.exception("Failed to read video metadata for %s", video_path)
+        recording_seconds = self._saved_video_duration_seconds(video_path, metadata, allow_probe=True)
+        changed = not bool(metadata)
+        metadata.setdefault("camera_name", self.config.camera_name)
+        metadata.setdefault("video_path", str(video_path))
+        metadata.setdefault("source", "uploaded")
+        metadata.setdefault("started_at_epoch", video_path.stat().st_mtime)
+        metadata.setdefault("first_frame_at_epoch", None)
+        metadata.setdefault("ends_at_epoch", None)
+        metadata.setdefault("zone_ids", [])
+        metadata.setdefault("event_count", 0)
+        metadata.setdefault("prebuffer_seconds", 0.0)
+        if float(metadata.get("recording_seconds") or 0.0) <= 0 and recording_seconds > 0:
+            metadata["recording_seconds"] = recording_seconds
+            changed = True
+        elif "recording_seconds" not in metadata:
+            metadata["recording_seconds"] = 0.0
+            changed = True
+        if changed:
+            metadata_path.write_text(json.dumps(metadata, indent=2))
+        return metadata
+
     def _format_duration_label(self, seconds: float) -> str:
+        if seconds <= 0:
+            return "Unknown"
         total_seconds = max(0, int(round(seconds)))
         hours, remainder = divmod(total_seconds, 3600)
         minutes, secs = divmod(remainder, 60)
@@ -4879,6 +5133,28 @@ a {{ color: #93c5fd; }}
         video_path: Path,
         limit: int,
     ) -> List[CandidateFrame]:
+        if shutil.which("ffmpeg"):
+            duration_seconds = self._saved_video_duration_seconds(video_path)
+            if duration_seconds <= 0:
+                target_seconds = [0.0]
+            else:
+                target_seconds = self._video_extraction_timestamps(0.0, duration_seconds, limit)
+            candidates: List[CandidateFrame] = []
+            for position_seconds in target_seconds:
+                frame = self._extract_local_video_frame_with_ffmpeg(video_path, position_seconds)
+                if frame is None:
+                    continue
+                candidates.append(
+                    CandidateFrame(
+                        frame=frame.copy(),
+                        timestamp=position_seconds,
+                        motion_area=0,
+                        sharpness=self._compute_sharpness(self._plate_crop(frame)),
+                        jpeg_bytes=self._encode_jpeg(frame),
+                        source="video",
+                    )
+                )
+            return candidates
         capture = cv2.VideoCapture(str(video_path))
         if not capture.isOpened():
             raise ValueError(f"Could not open {video_path.name}")
@@ -4913,45 +5189,144 @@ a {{ color: #93c5fd; }}
             form = self._read_simple_form(handler)
             relative_path = str(form.get("path") or "")
             video_path = self._saved_video_path_from_relative(relative_path)
-            candidates = self._extract_saved_video_candidates(video_path, max(1, min(self.config.upload_top_frames, 48)))
-            if not candidates:
-                raise ValueError("No images could be extracted from that video")
-            stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-            event_name = f"{self.config.camera_name}_video_extract_{stamp}"
-            event_dir = self.config.image_output_dir / event_name
-            event_dir.mkdir(parents=True, exist_ok=True)
-            saved_paths: List[Path] = []
-            for index, candidate in enumerate(candidates, start=1):
-                pipeline = self._run_detection_pipeline(
-                    candidate.frame,
-                    event_dir,
-                    f"frame_{index:02d}",
-                    event_name,
-                    time.time(),
-                    enable_alpr=False,
-                    jpeg_bytes=candidate.jpeg_bytes,
-                )
-                saved_paths.append(pipeline["frame_path"])
-            summary = {
-                "camera_name": self.config.camera_name,
-                "started_at_epoch": time.time(),
-                "ended_at_epoch": time.time(),
-                "trigger_count": 0,
-                "saved_frames": len(saved_paths),
-                "clip_path": self._relative_video_path(video_path),
-                "video_extract": True,
-                "image_source": "video",
-                "event_policy": "images-only",
-                "zone_images": [],
-                "fast_alpr_results_count": 0,
-                "openalpr_results_count": 0,
-                "plates": [],
-            }
-            (event_dir / "summary.json").write_text(json.dumps(summary, indent=2))
-            self._prune_saved_images()
-            handler.send_response(HTTPStatus.SEE_OTHER)
-            handler.send_header("Location", "/images")
+            metadata = self._load_or_create_video_metadata(video_path)
+            job_id = f"extract_{int(time.time() * 1000)}"
+            body = json.dumps({"ok": True, "job_id": job_id, "message": f"Extracting images from {video_path.name}…"}).encode("utf-8")
+            handler.send_response(HTTPStatus.ACCEPTED)
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
             handler.end_headers()
+            handler.wfile.write(body)
+            def _do_extract() -> None:
+                expected_total = max(1, min(self.config.upload_top_frames, 48))
+                self.extraction_status[job_id] = {
+                    "done": False,
+                    "saved": 0,
+                    "total": expected_total,
+                    "video": video_path.name,
+                    "error": None,
+                    "stage": "sampling",
+                }
+                try:
+                    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                    event_name = f"{self.config.camera_name}_video_extract_{stamp}"
+                    event_dir = self.config.image_output_dir / event_name
+                    event_dir.mkdir(parents=True, exist_ok=True)
+                    saved_paths: List[Path] = []
+                    duration_seconds = self._saved_video_duration_seconds(video_path, metadata, allow_probe=True)
+                    if duration_seconds <= 0:
+                        target_seconds = [0.0]
+                    else:
+                        target_seconds = self._video_extraction_timestamps(
+                            0.0,
+                            duration_seconds,
+                            max(1, min(self.config.upload_top_frames, 48)),
+                        )
+                    self.extraction_status[job_id]["total"] = len(target_seconds)
+                    self.extraction_status[job_id]["stage"] = "saving"
+                    failed_frames = 0
+                    for index, position_seconds in enumerate(target_seconds, start=1):
+                        frame = self._extract_local_video_frame_with_ffmpeg(video_path, position_seconds)
+                        if frame is None:
+                            failed_frames += 1
+                            if not saved_paths and failed_frames >= 3:
+                                raise ValueError(
+                                    f"Could not decode frames from {video_path.name}. "
+                                    "This uploaded video format may not be readable on the Pi."
+                                )
+                            continue
+                        failed_frames = 0
+                        candidate = CandidateFrame(
+                            frame=frame.copy(),
+                            timestamp=position_seconds,
+                            motion_area=0,
+                            sharpness=self._compute_sharpness(self._plate_crop(frame)),
+                            jpeg_bytes=self._encode_jpeg(frame),
+                            source="video",
+                        )
+                        pipeline = self._run_detection_pipeline(
+                            candidate.frame,
+                            event_dir,
+                            f"frame_{index:02d}",
+                            event_name,
+                            position_seconds,
+                            enable_alpr=False,
+                            jpeg_bytes=candidate.jpeg_bytes,
+                        )
+                        saved_paths.append(pipeline["frame_path"])
+                        self.extraction_status[job_id]["saved"] = len(saved_paths)
+                    if not saved_paths:
+                        self.extraction_status[job_id] = {"done": True, "saved": 0, "total": 0, "video": video_path.name, "error": "No frames could be extracted", "stage": "done"}
+                        return
+                    summary = {
+                        "camera_name": self.config.camera_name,
+                        "started_at_epoch": time.time(),
+                        "ended_at_epoch": time.time(),
+                        "trigger_count": 0,
+                        "saved_frames": len(saved_paths),
+                        "clip_path": self._relative_video_path(video_path),
+                        "video_extract": True,
+                        "image_source": "video",
+                        "event_policy": "images-only",
+                        "zone_images": [],
+                        "fast_alpr_results_count": 0,
+                        "openalpr_results_count": 0,
+                        "plates": [],
+                    }
+                    (event_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+                    self._prune_saved_images()
+                    self.extraction_status[job_id]["done"] = True
+                    self.extraction_status[job_id]["stage"] = "done"
+                    self._add_event_log("image", f"Extracted {len(saved_paths)} images from {video_path.name}")
+                    logging.info("Extracted %s images from %s into %s", len(saved_paths), video_path.name, event_dir.name)
+                except Exception as exc:
+                    self.extraction_status[job_id] = {"done": True, "saved": 0, "total": 0, "video": video_path.name, "error": str(exc)}
+                    logging.exception("Background image extraction failed for %s", video_path)
+            threading.Thread(target=_do_extract, daemon=True).start()
+        except Exception as exc:
+            body = json.dumps({"error": str(exc)}).encode("utf-8")
+            handler.send_response(HTTPStatus.BAD_REQUEST)
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+    def _handle_video_upload(self, handler: BaseHTTPRequestHandler) -> None:
+        try:
+            _, files = self._read_multipart_form(handler, max_bytes=500 * 1024 * 1024)
+            video_file = files.get("video")
+            video_bytes = bytes((video_file or {}).get("payload") or (video_file or {}).get("data") or b"")
+            if not video_file or not video_bytes:
+                raise ValueError("No video file provided")
+            filename = video_file.get("filename") or "upload.mp4"
+            safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", Path(filename).name)
+            if not safe_name.lower().endswith(".mp4"):
+                safe_name = Path(safe_name).stem + ".mp4"
+            stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            output_path = self._video_output_dir() / f"{self.config.camera_name}_upload_{stamp}_{safe_name}"
+            output_path.write_bytes(video_bytes)
+            output_path.with_suffix(".json").write_text(
+                json.dumps(
+                    {
+                        "camera_name": self.config.camera_name,
+                        "video_path": str(output_path),
+                        "source": "uploaded",
+                        "started_at_epoch": time.time(),
+                        "first_frame_at_epoch": None,
+                        "ends_at_epoch": None,
+                        "zone_ids": [],
+                        "event_count": 0,
+                        "prebuffer_seconds": 0.0,
+                        "recording_seconds": 0.0,
+                    },
+                    indent=2,
+                )
+            )
+            body = json.dumps({"ok": True, "message": f"Uploaded {output_path.name}"}).encode("utf-8")
+            handler.send_response(HTTPStatus.OK)
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
         except Exception as exc:
             body = json.dumps({"error": str(exc)}).encode("utf-8")
             handler.send_response(HTTPStatus.BAD_REQUEST)
@@ -4996,16 +5371,18 @@ a {{ color: #93c5fd; }}
             result_path = image_path.with_name(f"{image_path.stem}.manual_fast_alpr.json")
             result_path.write_text(json.dumps(result, indent=2))
             relative = self._relative_image_path(image_path)
-            body = self._render_saved_image_fast_alpr_result_page(relative, result, result_path).encode("utf-8")
+            detections = self._extract_fast_alpr_detections(result, relative, event_dir.name, time.time())
+            plates_text = ", ".join(f"{d.plate} ({d.confidence:.2f})" for d in detections) or "No plates detected"
+            body = json.dumps({"ok": True, "message": f"ALPR: {plates_text}"}).encode("utf-8")
             handler.send_response(HTTPStatus.OK)
-            handler.send_header("Content-Type", "text/html; charset=utf-8")
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
             handler.send_header("Content-Length", str(len(body)))
             handler.end_headers()
             handler.wfile.write(body)
         except Exception as exc:
-            body = self._render_saved_image_fast_alpr_error_page(str(exc)).encode("utf-8")
+            body = json.dumps({"error": str(exc)}).encode("utf-8")
             handler.send_response(HTTPStatus.BAD_REQUEST)
-            handler.send_header("Content-Type", "text/html; charset=utf-8")
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
             handler.send_header("Content-Length", str(len(body)))
             handler.end_headers()
             handler.wfile.write(body)
@@ -5260,19 +5637,13 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
         download_icon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a1 1 0 0 1 1 1v8.59l2.3-2.29 1.4 1.4-4.7 4.7-4.7-4.7 1.4-1.4L11 12.59V4a1 1 0 0 1 1-1Z"/><path d="M5 19h14v2H5z"/></svg>'
         remove_icon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6l1 2h5v2H3V5h5l1-2Zm1 6h2v8h-2V9Zm4 0h2v8h-2V9ZM6 9h2v8H6V9Zm1 12a2 2 0 0 1-2-2V8h14v11a2 2 0 0 1-2 2H7Z"/></svg>'
         fullscreen_icon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h5v2H7v3H5V5Zm12 0h2v5h-2V7h-3V5h3ZM5 14h2v3h3v2H5v-5Zm12 3v-3h2v5h-5v-2h3Z"/></svg>'
-        live_preview_url = "/stream-clean.mjpg"
         selected_relative = self._relative_video_path(selected_video) if selected_video else ""
         selected_player_html = "<p>Select a video from the list below.</p>"
-        live_player_html = (
-            f'<div class="player-card"><span class="eyebrow">Live Camera</span>'
-            f'<div class="live-wrap"><img id="videos-live-preview" alt="Live camera preview"></div>'
-            f'<div class="player-links"><a href="/live">Open live page</a><a href="{self._live_hls_url()}">Open live HLS playlist</a></div></div>'
-        )
         if selected_video is not None:
             selected_video_url = self._event_file_url(selected_relative)
             selected_player_html = (
                 f'<div class="player-card"><span class="eyebrow">Now Playing</span>'
-                f'<div class="player-wrap"><video id="gallery-video-player" controls autoplay preload="metadata" src="{selected_video_url}"></video>'
+                f'<div class="player-wrap"><video id="gallery-video-player" controls preload="none" src="{selected_video_url}"></video>'
                 f'<button id="gallery-video-fullscreen" class="player-overlay-button" type="button" aria-label="Fullscreen" title="Fullscreen">{fullscreen_icon}</button></div>'
                 f'<p class="player-path">{html.escape(selected_relative)}</p>'
                 f'<div class="player-links"><a href="{self._video_detail_url(selected_relative)}">Detail</a>'
@@ -5295,7 +5666,9 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
                         started_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(started_at)))
                 except Exception:
                     pass
-            duration_text = self._format_duration_label(self._saved_video_duration_seconds(video_path, metadata))
+            duration_text = self._format_duration_label(
+                self._saved_video_duration_seconds(video_path, metadata, allow_probe=False)
+            )
             zone_dots = "".join(
                 f'<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:{zone_dot_colors.get(z, "#94a3b8")};flex-shrink:0;" title="{html.escape(z)}"></span>'
                 for z in zone_ids
@@ -5312,56 +5685,26 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
                 f'{zone_badges_html}'
                 f'</div></div>'
                 f'<div class="video-actions" style="align-items:center;">'
-                f'<a class="video-icon-button" href="{select_link}" aria-label="Play video" title="Play video">{play_icon}</a>'
-                f'<a class="video-icon-button" href="{download_url}" download aria-label="Download video" title="Download video">{download_icon}</a>'
-                f'<form method="post" action="/api/videos/extract-images" class="video-icon-form" data-action-label="Extracting images" data-action-detail="{escaped_relative}">'
+                f'<div class="video-action-slot"><button class="video-icon-button" data-action="play" data-video-url="{self._event_file_url(relative)}" data-video-name="{escaped_relative}" aria-label="Play video" title="Play video">{play_icon}</button><span class="video-action-status"></span></div>'
+                f'<div class="video-action-slot"><a class="video-icon-button" href="{download_url}" download aria-label="Download video" title="Download video">{download_icon}</a><span class="video-action-status"></span></div>'
+                f'<div class="video-action-slot"><form method="post" action="/api/videos/extract-images" class="video-icon-form" data-action-label="Extracting images" data-action-detail="{escaped_relative}">'
                 f'<input type="hidden" name="path" value="{html.escape(relative, quote=True)}">'
                 f'<button type="submit" class="video-icon-button" aria-label="Extract images" title="Extract images">{image_icon}</button></form>'
-                f'<form method="post" action="/api/videos/quick-alpr" class="video-icon-form" data-action-label="Sending frame to ALPR" data-action-detail="{escaped_relative}">'
+                f'<span class="video-action-status" aria-live="polite"></span></div>'
+                f'<div class="video-action-slot"><form method="post" action="/api/videos/quick-alpr" class="video-icon-form" data-action-label="Sending frame to ALPR" data-action-detail="{escaped_relative}">'
                 f'<input type="hidden" name="path" value="{html.escape(relative, quote=True)}">'
-                f'<button type="submit" class="video-icon-button" aria-label="Send video frame to ALPR" title="Send video frame to ALPR">{car_icon}</button></form>'
-                f'<form method="post" action="/api/videos/delete" class="video-icon-form" data-action-label="Removing video" data-action-detail="{escaped_relative}" onsubmit="return confirm(\'Remove this video?\');">'
+                f'<button type="submit" class="video-icon-button" aria-label="Send video frame to ALPR" title="Send video frame to ALPR">{car_icon}</button></form><span class="video-action-status"></span></div>'
+                f'<div class="video-action-slot"><form method="post" action="/api/videos/delete" class="video-icon-form" data-action-label="Removing video" data-action-detail="{escaped_relative}" data-double-confirm="Remove video">'
                 f'<input type="hidden" name="path" value="{html.escape(relative, quote=True)}">'
                 f'<input type="hidden" name="page" value="{page}">'
-                f'<button type="submit" class="video-icon-button danger" aria-label="Remove video" title="Remove video">{remove_icon}</button></form>'
+                f'<button type="submit" class="video-icon-button danger" aria-label="Remove video" title="Remove video">{remove_icon}</button></form><span class="video-action-status"></span></div>'
                 f'</div></div>'
             )
         player_script = """<script>
 (() => {
-  const liveImage = document.getElementById('videos-live-preview');
-  if (liveImage) {
-    const livePreviewUrl = %s;
-    let livePreviewRetryTimer = null;
-
-    const attachLivePreview = () => {
-      liveImage.onload = () => {};
-      liveImage.onerror = () => {
-        if (livePreviewRetryTimer) return;
-        livePreviewRetryTimer = window.setTimeout(() => {
-          livePreviewRetryTimer = null;
-          attachLivePreview();
-        }, 3000);
-      };
-      liveImage.src = `${livePreviewUrl}?v=${Date.now()}`;
-    };
-
-    attachLivePreview();
-  }
-
   const button = document.getElementById('gallery-video-fullscreen');
   const video = document.getElementById('gallery-video-player');
   if (button && video) {
-    const startPlayback = () => {
-      const playPromise = video.play();
-      if (playPromise && typeof playPromise.catch === 'function') {
-        playPromise.catch(() => {});
-      }
-    };
-    if (video.readyState >= 2) {
-      startPlayback();
-    } else {
-      video.addEventListener('loadeddata', startPlayback, { once: true });
-    }
     button.addEventListener('click', async () => {
       const target = video.parentElement || video;
       try {
@@ -5382,7 +5725,20 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
   const spinner = document.getElementById('action-spinner');
   const close = document.getElementById('action-close');
   const forms = Array.from(document.querySelectorAll('.video-icon-form'));
-  if (!overlay || !title || !message || !spinner || !close || !forms.length) return;
+  const playButtons = Array.from(document.querySelectorAll('[data-action="play"]'));
+
+  function armDoubleConfirm(form, button) {
+    if (!form || !button) return;
+    button.classList.add('confirm-armed');
+    form.dataset.confirmArmed = 'true';
+  }
+
+  function resetDoubleConfirm(form) {
+    const button = form && form.querySelector('button[type="submit"], button:not([type])');
+    if (!button) return;
+    button.classList.remove('confirm-armed');
+    delete form.dataset.confirmArmed;
+  }
 
   function setOverlayState(heading, detail, finished = false) {
     title.textContent = heading;
@@ -5398,53 +5754,119 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
     close.style.display = 'none';
   }
 
-  close.addEventListener('click', hideOverlay);
+  if (close) close.addEventListener('click', hideOverlay);
+
+  playButtons.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const videoUrl = btn.dataset.videoUrl;
+      const videoName = btn.dataset.videoName;
+      const playerStack = document.querySelector('.player-stack');
+      if (!playerStack || !videoUrl) return;
+      const fullscreenIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h5v2H7v3H5V5Zm12 0h2v5h-2V7h-3V5h3ZM5 14h2v3h3v2H5v-5Zm12 3v-3h2v5h-5v-2h3Z"/></svg>';
+      playerStack.innerHTML = `<div class="player-card"><span class="eyebrow">Now Playing</span><div class="player-wrap"><video id="gallery-video-player" controls preload="metadata" src="${videoUrl}"></video><button id="gallery-video-fullscreen" class="player-overlay-button" type="button" aria-label="Fullscreen" title="Fullscreen">${fullscreenIcon}</button></div><p class="player-path">${videoName}</p></div>`;
+      const newVideo = document.getElementById('gallery-video-player');
+      if (newVideo) newVideo.play().catch(() => {});
+      const fsBtn = document.getElementById('gallery-video-fullscreen');
+      if (fsBtn && newVideo) {
+        fsBtn.addEventListener('click', async () => {
+          const target = newVideo.parentElement || newVideo;
+          try {
+            if (document.fullscreenElement) await document.exitFullscreen();
+            else if (target.requestFullscreen) await target.requestFullscreen();
+          } catch (e) {}
+        });
+      }
+      document.querySelectorAll('.video-row').forEach((row) => row.classList.remove('active'));
+      btn.closest('.video-row')?.classList.add('active');
+    });
+  });
 
   forms.forEach((form) => {
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
       const submitter = form.querySelector('button');
+      const statusEl = form.action.includes('/api/videos/extract-images') && form.nextElementSibling && form.nextElementSibling.classList.contains('video-action-status')
+        ? form.nextElementSibling
+        : null;
+      if (form.dataset.doubleConfirm && form.dataset.confirmArmed !== 'true') {
+        forms.forEach((otherForm) => {
+          if (otherForm !== form) resetDoubleConfirm(otherForm);
+        });
+        armDoubleConfirm(form, submitter);
+        return;
+      }
       const label = form.dataset.actionLabel || 'Working';
       const detail = form.dataset.actionDetail || 'Please wait while the request completes.';
       if (submitter) submitter.disabled = true;
-      setOverlayState(label + '...', detail);
+      if (submitter && form.action.includes('/api/videos/extract-images')) submitter.classList.add('busy');
+      if (statusEl) statusEl.textContent = '0';
+      if (overlay) setOverlayState(label + '...', detail);
       try {
+        const formData = new FormData(form);
+        const payload = {};
+        formData.forEach((value, key) => { payload[key] = value; });
         const response = await fetch(form.action, {
           method: 'POST',
-          body: new FormData(form),
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
         });
-        const contentType = response.headers.get('content-type') || '';
-        if (response.redirected) {
-          window.location.href = response.url;
-          return;
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Action failed');
+        if (data.deleted) {
+          form.closest('.video-row')?.remove();
+          hideOverlay();
+        } else if (data.job_id) {
+          if (overlay) setOverlayState('Extracting images…', 'Starting…', false);
+          const jobId = data.job_id;
+          const poll = setInterval(async () => {
+            try {
+              const r = await fetch('/api/extraction-status', { cache: 'no-store' });
+              const status = await r.json();
+              const job = status[jobId];
+              if (!job) return;
+              if (job.error) {
+                clearInterval(poll);
+                if (submitter) submitter.classList.remove('busy');
+                if (submitter) submitter.disabled = false;
+                if (statusEl) statusEl.textContent = 'Err';
+                if (overlay) setOverlayState('Extraction failed', job.error, true);
+              } else if (job.done) {
+                clearInterval(poll);
+                if (submitter) submitter.classList.remove('busy');
+                if (submitter) submitter.disabled = false;
+                if (statusEl) statusEl.textContent = `${job.saved}`;
+                if (overlay) setOverlayState('Done', `Saved ${job.saved} images from ${job.video}. Open the Images page to review them.`, true);
+              } else {
+                const total = job.total || '?';
+                if (statusEl) statusEl.textContent = `${job.saved}/${total}`;
+                if (overlay) setOverlayState('Extracting images…', `Saved ${job.saved} of ${total} images from ${job.video}`, false);
+              }
+            } catch (e) {}
+          }, 500);
+        } else {
+          if (overlay) setOverlayState('Done', data.message || 'Action completed.', true);
         }
-        if (contentType.includes('text/html')) {
-          const text = await response.text();
-          document.open();
-          document.write(text);
-          document.close();
-          return;
-        }
-        if (contentType.includes('application/json')) {
-          const payload = await response.json();
-          if (!response.ok) throw new Error(payload.error || 'Action failed');
-          setOverlayState('Finished', payload.message || 'The action completed successfully.', true);
-          return;
-        }
-        if (!response.ok) {
-          throw new Error('Action failed');
-        }
-        setOverlayState('Finished', 'The action completed successfully.', true);
       } catch (error) {
-        setOverlayState('Action failed', error.message || 'The request did not finish successfully.', true);
+        if (statusEl) statusEl.textContent = 'Err';
+        if (overlay) setOverlayState('Action failed', error.message || 'The request did not finish successfully.', true);
       } finally {
-        if (submitter) submitter.disabled = false;
+        resetDoubleConfirm(form);
+        if (submitter && !form.action.includes('/api/videos/extract-images')) submitter.disabled = false;
+        if (submitter && !form.action.includes('/api/videos/extract-images')) submitter.classList.remove('busy');
       }
     });
+    const submitter = form.querySelector('button');
+    if (submitter) {
+      submitter.addEventListener('blur', () => {
+        window.setTimeout(() => {
+          if (!form.contains(document.activeElement)) resetDoubleConfirm(form);
+        }, 0);
+      });
+    }
   });
 })();
-</script>""" % json.dumps(live_preview_url)
-        return f'<div class="video-layout"><div class="player-stack">{live_player_html}{selected_player_html}</div><div class="card"><span class="eyebrow">Clips</span><div class="video-list">{"".join(rows)}</div></div></div>' + player_script
+</script>"""
+        return f'<div class="video-layout"><div class="player-stack">{selected_player_html}</div><div class="card"><span class="eyebrow">Clips</span><div class="video-list">{"".join(rows)}</div></div></div>' + player_script
 
     def _serve_video_detail_page(self, handler: BaseHTTPRequestHandler, relative_path: str) -> None:
         try:
@@ -5617,9 +6039,12 @@ video {{ width: 100%; border-radius: 10px; display: block; background: #000; }}
             metadata_path = video_path.with_suffix(".json")
             video_path.unlink(missing_ok=True)
             metadata_path.unlink(missing_ok=True)
-            handler.send_response(HTTPStatus.SEE_OTHER)
-            handler.send_header("Location", f"/videos?page={page}")
+            body = json.dumps({"ok": True, "message": "Video deleted", "deleted": relative_path}).encode("utf-8")
+            handler.send_response(HTTPStatus.OK)
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
             handler.end_headers()
+            handler.wfile.write(body)
         except Exception as exc:
             body = json.dumps({"error": str(exc)}).encode("utf-8")
             handler.send_response(HTTPStatus.BAD_REQUEST)
