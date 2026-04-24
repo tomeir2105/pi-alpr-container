@@ -17,7 +17,7 @@ services:
       IMAGE_OUTPUT_DIR: ${IMAGE_OUTPUT_DIR:-/data/events/images}
       VIDEO_OUTPUT_DIR: ${VIDEO_OUTPUT_DIR:-/data/events/videos}
       LOG_OUTPUT_DIR: ${LOG_OUTPUT_DIR:-/data/logs}
-      ALPR_ENV_FILE: /app/.env
+      ALPR_ENV_FILE: /data/config/.env
       HOME: /data/watcher-home
       TMPDIR: /tmp
       PYTHONDONTWRITEBYTECODE: "1"

@@ -67,7 +67,7 @@ If you want local filtering before OpenALPR, also set:
 Example for a second Pi:
 
 ```dotenv
-FAST_ALPR_URL=http://192.168.1.50:8090
+FAST_ALPR_URL=http://192.168.1.24:8090
 ```
 
 For the built-in web UI, you can also set:
@@ -116,13 +116,14 @@ When the watcher is running, open:
 - `FRAME_WIDTH=960` keeps processing, streaming, and recordings bounded. Use `0` only if the host has enough CPU/RAM for the camera's native resolution.
 - `MIN_MOTION_AREA` filters out tiny motion like rain, trees, and shadows.
 - `MIN_CONSECUTIVE_HITS` helps avoid one-frame false triggers.
-- `PREBUFFER_SECONDS` keeps video from before the trigger.
+- `PREBUFFER_SECONDS` keeps video from before the trigger. The default is 10 seconds.
 - `POSTBUFFER_SECONDS` keeps video after the last motion.
 - `PREBUFFER_FRAMES` overrides `PREBUFFER_SECONDS` if you prefer an exact frame count.
 - `POSTBUFFER_FRAMES` overrides `POSTBUFFER_SECONDS` if you prefer an exact frame count.
 - `EVENT_IDLE_SECONDS` is how long motion must stop before the event can close.
 - `EVENT_MAX_SECONDS` forces an event to close even if motion detection keeps reporting movement.
-- `UPLOAD_TOP_FRAMES` controls how many images are sampled across the event/video timeline or manual video extraction job.
+- `UPLOAD_TOP_FRAMES` controls how many images are sampled across the event/video timeline.
+- `MANUAL_EXTRACT_IMAGE_COUNT` controls how many images the Videos page extracts when you click the extract images icon. The default is 20.
 - `UPLOAD_MIN_SHARPNESS` skips blurry frames when possible.
 - `FAST_ALPR_URL` enables plate recognition before cloud upload and can point to another Pi.
 - `FAST_ALPR_MIN_CONFIDENCE` is the minimum local OCR confidence required before a frame is sent to OpenALPR.
@@ -170,11 +171,12 @@ MIN_MOTION_AREA=2500
 MIN_CONSECUTIVE_HITS=3
 EVENT_IDLE_SECONDS=1.5
 EVENT_MAX_SECONDS=60.0
-PREBUFFER_SECONDS=2.0
+PREBUFFER_SECONDS=10.0
 POSTBUFFER_SECONDS=5.0
 PREBUFFER_FRAMES=0
 POSTBUFFER_FRAMES=0
 UPLOAD_TOP_FRAMES=240
+MANUAL_EXTRACT_IMAGE_COUNT=20
 UPLOAD_MIN_SHARPNESS=80.0
 FAST_ALPR_URL=http://192.168.1.50:8090
 FAST_ALPR_MIN_CONFIDENCE=0.75

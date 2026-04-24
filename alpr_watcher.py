@@ -1284,7 +1284,7 @@ class RtspVehicleWatcher:
     def _prebuffer_frame_limit(self) -> int:
         if self.config.prebuffer_frames > 0:
             return self.config.prebuffer_frames
-        return int(self.fps_guess * max(0.1, self.config.prebuffer_seconds))
+        return int(self.fps_guess * max(0.1, self._video_prebuffer_seconds()))
 
     def _postbuffer_frame_limit(self) -> int:
         if self.config.postbuffer_frames > 0:
@@ -2061,6 +2061,25 @@ class RtspVehicleWatcher:
                 return frame
         return None
 
+    def _extract_local_video_frame_with_opencv(self, video_path: Path, position_seconds: float):
+        capture = cv2.VideoCapture(str(video_path))
+        if not capture.isOpened():
+            return None
+        try:
+            capture.set(cv2.CAP_PROP_POS_MSEC, max(0.0, position_seconds) * 1000.0)
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                return None
+            return frame
+        finally:
+            capture.release()
+
+    def _extract_local_video_frame(self, video_path: Path, position_seconds: float):
+        frame = self._extract_local_video_frame_with_opencv(video_path, position_seconds)
+        if frame is not None:
+            return frame
+        return self._extract_local_video_frame_with_ffmpeg(video_path, position_seconds)
+
     def _extract_video_event_candidates(
         self,
         video_path: Path,
@@ -2748,7 +2767,12 @@ class RtspVehicleWatcher:
         }
 
     def _env_file_path(self) -> Path:
-        return Path(os.getenv("ALPR_ENV_FILE") or os.getenv("APP_ENV_FILE") or ".env").expanduser()
+        configured_path = Path(os.getenv("ALPR_ENV_FILE") or os.getenv("APP_ENV_FILE") or ".env").expanduser()
+        if configured_path == Path("/app/.env"):
+            data_config_path = Path("/data/config/.env")
+            if data_config_path.exists() or data_config_path.parent.exists():
+                return data_config_path
+        return configured_path
 
     def _read_env_text(self) -> str:
         env_path = self._env_file_path()
@@ -3448,7 +3472,7 @@ h1 { margin-top: 0; }
         const job = status[jobId];
         if (!job) return;
         if (job.done || job.stage === 'cancelled') {{
-          counter.textContent = job.stage === 'cancelled' ? `stopped (${{job.saved}})` : `done (${{job.saved}})`;
+          counter.textContent = job.error ? 'failed' : (job.stage === 'partial' ? `partial (${{job.saved}}/${{job.total}})` : (job.stage === 'cancelled' ? `stopped (${{job.saved}})` : `done (${{job.saved}})`));
           setTimeout(hideIndicator, 3000);
           clearInterval(pollTimer); pollTimer = null;
           if (window.__onExtractionDone) window.__onExtractionDone(jobId, job);
@@ -4147,9 +4171,15 @@ a {{ color: #93c5fd; }}
 .card-filename {{ margin: 0; flex: 1; min-width: 0; }}
 .card-icon-form {{ margin: 0; flex-shrink: 0; }}
 .card-icon-button {{ display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 999px; border: 1px solid #334155; background: transparent; color: #cbd5e1; cursor: pointer; padding: 0; }}
-.card-icon-button svg {{ width: 18px; height: 18px; fill: currentColor; display: block; }}
-.card-icon-button:hover {{ border-color: #facc15; color: #facc15; background: #172033; }}
-.pagination {{ display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 18px 0; }}
+	.card-icon-button svg {{ width: 18px; height: 18px; fill: currentColor; display: block; }}
+	.card-icon-button:hover {{ border-color: #facc15; color: #facc15; background: #172033; }}
+	.alpr-popup {{ position: fixed; inset: 0; background: rgba(2, 6, 23, 0.72); display: none; align-items: center; justify-content: center; z-index: 1000; padding: 24px; }}
+	.alpr-popup.visible {{ display: flex; }}
+	.alpr-popup-card {{ width: min(92vw, 420px); background: #111827; border: 1px solid #334155; border-radius: 8px; padding: 22px; text-align: center; box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35); }}
+	.alpr-popup-card h2 {{ margin: 0; font-size: 1.1rem; }}
+	.alpr-popup-card p {{ margin: 10px 0 0; color: #cbd5e1; }}
+	.alpr-popup-close {{ margin-top: 14px; background: #facc15; color: #111827; border: 0; border-radius: 8px; padding: 9px 14px; cursor: pointer; font-weight: 700; }}
+	.pagination {{ display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 18px 0; }}
 .pagination a, .pagination span {{ border: 1px solid #334155; border-radius: 8px; padding: 8px 12px; text-decoration: none; }}
 .pagination span {{ color: #94a3b8; }}
 img {{ width: 100%; border-radius: 10px; display: block; }}
@@ -4163,11 +4193,65 @@ p {{ margin: 8px 0 0; word-break: break-word; }}
 <h1>Captured images</h1>
 <p>Keeping only the newest {self.config.max_saved_images} images.</p>
 {summary}
-{pagination}
-<div class="grid">{gallery}</div>
-{pagination}
-</div>
-</body></html>"""
+	{pagination}
+	<div class="grid">{gallery}</div>
+	{pagination}
+	</div>
+	<div class="alpr-popup" id="alpr-popup" role="dialog" aria-modal="true" aria-labelledby="alpr-popup-title">
+	  <div class="alpr-popup-card">
+	    <h2 id="alpr-popup-title">ALPR</h2>
+	    <p id="alpr-popup-message">Sending...</p>
+	    <button class="alpr-popup-close" id="alpr-popup-close" type="button">Close</button>
+	  </div>
+	</div>
+	<script>
+	(() => {{
+	  const popup = document.getElementById('alpr-popup');
+	  const title = document.getElementById('alpr-popup-title');
+	  const message = document.getElementById('alpr-popup-message');
+	  const close = document.getElementById('alpr-popup-close');
+	  const forms = Array.from(document.querySelectorAll('form.card-icon-form[action="/api/images/alpr"]'));
+	  if (!popup || !title || !message || !close || !forms.length) return;
+
+	  function showPopup(heading, text) {{
+	    title.textContent = heading;
+	    message.textContent = text;
+	    popup.classList.add('visible');
+	  }}
+
+	  close.addEventListener('click', () => popup.classList.remove('visible'));
+	  popup.addEventListener('click', (event) => {{
+	    if (event.target === popup) popup.classList.remove('visible');
+	  }});
+
+	  forms.forEach((form) => {{
+	    form.addEventListener('submit', async (event) => {{
+	      event.preventDefault();
+	      const button = form.querySelector('button');
+	      if (button) button.disabled = true;
+	      showPopup('ALPR', 'Sending image...');
+	      try {{
+	        const formData = new FormData(form);
+	        const payload = {{}};
+	        formData.forEach((value, key) => {{ payload[key] = value; }});
+	        const response = await fetch(form.action, {{
+	          method: 'POST',
+	          headers: {{ 'Content-Type': 'application/json' }},
+	          body: JSON.stringify(payload),
+	        }});
+	        const data = await response.json();
+	        if (!response.ok) throw new Error(data.error || 'ALPR request failed');
+	        showPopup('ALPR Result', data.message || 'ALPR request completed.');
+	      }} catch (error) {{
+	        showPopup('ALPR Failed', error.message || 'ALPR request failed.');
+	      }} finally {{
+	        if (button) button.disabled = false;
+	      }}
+	    }});
+	  }});
+	}})();
+	</script>
+	</body></html>"""
 
     def _render_videos_page(self, page: int = 1, selected_relative: str = "") -> str:
         videos = self._list_saved_videos()
@@ -4242,7 +4326,7 @@ a {{ color: #93c5fd; }}
 .action-overlay {{ position: fixed; inset: 0; background: rgba(2, 6, 23, 0.72); display: none; align-items: center; justify-content: center; z-index: 1000; padding: 24px; }}
 .action-overlay.visible {{ display: flex; }}
 .action-overlay-card {{ min-width: min(92vw, 360px); max-width: 420px; background: #111827; border: 1px solid #334155; border-radius: 18px; padding: 22px; text-align: center; box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35); }}
-.action-overlay-card p {{ margin: 10px 0 0; color: #cbd5e1; }}
+.action-overlay-card p {{ margin: 10px 0 0; color: #cbd5e1; white-space: pre-wrap; text-align: left; }}
 .action-spinner {{ width: 34px; height: 34px; margin: 0 auto; border-radius: 999px; border: 3px solid #334155; border-top-color: #facc15; animation: spin 0.9s linear infinite; }}
 .action-progress {{ width: 100%; height: 12px; margin-top: 14px; border-radius: 999px; background: #1f2937; border: 1px solid #334155; overflow: hidden; display: none; }}
 .action-progress-bar {{ width: 0%; height: 100%; background: linear-gradient(90deg, #facc15, #fb7185); transition: width 0.12s ease-out; }}
@@ -4706,7 +4790,7 @@ a {{ color: #93c5fd; }}
             apply_runtime = bool(payload.get("apply", False))
             env_path = self._env_file_path()
             env_path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path = Path("/tmp") / (env_path.name + ".tmp")
+            temp_path = env_path.with_name(f"{env_path.name}.tmp")
             temp_path.write_text(content)
             temp_path.replace(env_path)
             apply_result: dict[str, Any] = {}
@@ -5292,16 +5376,22 @@ a {{ color: #93c5fd; }}
             handler.end_headers()
             handler.wfile.write(body)
             def _do_extract() -> None:
-                expected_total = max(1, min(self.config.upload_top_frames, 48))
+                requested_total = max(1, self.config.manual_extract_image_count)
+                expected_total = requested_total
                 self.extraction_status[job_id] = {
                     "done": False,
                     "saved": 0,
                     "total": expected_total,
                     "video": video_path.name,
+                    "video_path": str(video_path),
                     "error": None,
+                    "error_detail": None,
+                    "error_type": None,
                     "cancel": False,
                     "stage": "sampling",
+                    "requested_total": requested_total,
                 }
+                last_position_seconds = None
                 try:
                     stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
                     event_name = f"{self.config.camera_name}_video_extract_{stamp}"
@@ -5309,31 +5399,38 @@ a {{ color: #93c5fd; }}
                     event_dir.mkdir(parents=True, exist_ok=True)
                     saved_paths: List[Path] = []
                     duration_seconds = self._saved_video_duration_seconds(video_path, metadata, allow_probe=True)
+                    attempt_limit = requested_total
                     if duration_seconds <= 0:
                         target_seconds = [0.0]
                     else:
+                        attempt_limit = max(requested_total, requested_total * 4)
                         target_seconds = self._video_extraction_timestamps(
                             0.0,
                             duration_seconds,
-                            max(1, min(self.config.upload_top_frames, 48)),
+                            attempt_limit,
                         )
-                    self.extraction_status[job_id]["total"] = len(target_seconds)
+                    self.extraction_status[job_id]["total"] = requested_total
+                    self.extraction_status[job_id]["attempt_total"] = len(target_seconds)
+                    self.extraction_status[job_id]["duration_seconds"] = duration_seconds
+                    self.extraction_status[job_id]["event_dir"] = str(event_dir)
                     self.extraction_status[job_id]["stage"] = "saving"
                     failed_frames = 0
                     for index, position_seconds in enumerate(target_seconds, start=1):
+                        if len(saved_paths) >= requested_total:
+                            break
+                        last_position_seconds = position_seconds
+                        self.extraction_status[job_id]["current_index"] = len(saved_paths) + 1
+                        self.extraction_status[job_id]["attempt_index"] = index
+                        self.extraction_status[job_id]["current_position_seconds"] = position_seconds
                         if self.extraction_status[job_id].get("cancel"):
                             self.extraction_status[job_id]["done"] = True
                             self.extraction_status[job_id]["stage"] = "cancelled"
                             self._add_event_log("image", f"Extraction cancelled after {len(saved_paths)} images from {video_path.name}")
                             return
-                        frame = self._extract_local_video_frame_with_ffmpeg(video_path, position_seconds)
+                        frame = self._extract_local_video_frame(video_path, position_seconds)
                         if frame is None:
                             failed_frames += 1
-                            if not saved_paths and failed_frames >= 3:
-                                raise ValueError(
-                                    f"Could not decode frames from {video_path.name}. "
-                                    "This uploaded video format may not be readable on the Pi."
-                                )
+                            self.extraction_status[job_id]["failed_frames"] = failed_frames
                             continue
                         failed_frames = 0
                         candidate = CandidateFrame(
@@ -5347,7 +5444,7 @@ a {{ color: #93c5fd; }}
                         pipeline = self._run_detection_pipeline(
                             candidate.frame,
                             event_dir,
-                            f"frame_{index:02d}",
+                            f"frame_{len(saved_paths) + 1:02d}",
                             event_name,
                             position_seconds,
                             enable_alpr=False,
@@ -5356,8 +5453,29 @@ a {{ color: #93c5fd; }}
                         saved_paths.append(pipeline["frame_path"])
                         self.extraction_status[job_id]["saved"] = len(saved_paths)
                     if not saved_paths:
-                        self.extraction_status[job_id] = {"done": True, "saved": 0, "total": 0, "video": video_path.name, "error": "No frames could be extracted", "stage": "done"}
+                        error_detail = (
+                            f"No frames could be extracted from {video_path.name}. "
+                            f"Duration={duration_seconds:.3f}s, requested={requested_total}, sampled={len(target_seconds)}, failed={failed_frames}, "
+                            f"event_dir={event_dir}."
+                        )
+                        self.extraction_status[job_id].update({
+                            "done": True,
+                            "saved": 0,
+                            "error": "No frames could be extracted",
+                            "error_detail": error_detail,
+                            "error_type": "ValueError",
+                            "stage": "failed",
+                        })
+                        self._add_event_log("image", error_detail)
+                        logging.error(error_detail)
                         return
+                    if len(saved_paths) < requested_total:
+                        warning_detail = (
+                            f"Only {len(saved_paths)} of {requested_total} requested images could be extracted from {video_path.name}. "
+                            f"Tried {len(target_seconds)} positions; duration={duration_seconds:.3f}s."
+                        )
+                        self.extraction_status[job_id]["warning"] = warning_detail
+                        logging.warning(warning_detail)
                     summary = {
                         "camera_name": self.config.camera_name,
                         "started_at_epoch": time.time(),
@@ -5376,12 +5494,32 @@ a {{ color: #93c5fd; }}
                     (event_dir / "summary.json").write_text(json.dumps(summary, indent=2))
                     self._prune_saved_images()
                     self.extraction_status[job_id]["done"] = True
-                    self.extraction_status[job_id]["stage"] = "done"
+                    self.extraction_status[job_id]["stage"] = "partial" if len(saved_paths) < requested_total else "done"
                     self._add_event_log("image", f"Extracted {len(saved_paths)} images from {video_path.name}")
                     logging.info("Extracted %s images from %s into %s", len(saved_paths), video_path.name, event_dir.name)
                 except Exception as exc:
-                    self.extraction_status[job_id] = {"done": True, "saved": 0, "total": 0, "video": video_path.name, "error": str(exc)}
-                    logging.exception("Background image extraction failed for %s", video_path)
+                    status = self.extraction_status.get(job_id, {})
+                    error_detail = (
+                        f"{type(exc).__name__}: {exc}\n"
+                        f"video={video_path}\n"
+                        f"stage={status.get('stage', 'unknown')}, saved={status.get('saved', 0)}/{status.get('total', expected_total)}, "
+                        f"requested={requested_total}, duration={status.get('duration_seconds', 'unknown')}\n"
+                        f"index={status.get('current_index', 'unknown')}, position={status.get('current_position_seconds', last_position_seconds)}"
+                    )
+                    status.update({
+                        "done": True,
+                        "saved": status.get("saved", 0),
+                        "total": status.get("total", expected_total),
+                        "video": video_path.name,
+                        "video_path": str(video_path),
+                        "error": str(exc),
+                        "error_detail": error_detail,
+                        "error_type": type(exc).__name__,
+                        "stage": "failed",
+                    })
+                    self.extraction_status[job_id] = status
+                    self._add_event_log("image", f"Extraction failed for {video_path.name}: {type(exc).__name__}: {exc}")
+                    logging.exception("Background image extraction failed for %s: %s", video_path, error_detail)
             threading.Thread(target=_do_extract, daemon=True).start()
         except Exception as exc:
             body = json.dumps({"error": str(exc)}).encode("utf-8")
@@ -5699,9 +5837,15 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
 .icon-button.disabled {{ opacity: 0.35; color: #94a3b8; pointer-events: none; }}
 .alpr-action {{ margin-top: 12px; display: flex; align-items: center; gap: 10px; }}
 .alpr-icon-button {{ display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; border-radius: 999px; border: 1px solid #334155; background: transparent; color: #cbd5e1; cursor: pointer; padding: 0; }}
-.alpr-icon-button svg {{ width: 22px; height: 22px; fill: currentColor; display: block; }}
-.alpr-icon-button:hover {{ border-color: #facc15; color: #facc15; background: #172033; }}
-{self._render_shared_styles()}
+	.alpr-icon-button svg {{ width: 22px; height: 22px; fill: currentColor; display: block; }}
+	.alpr-icon-button:hover {{ border-color: #facc15; color: #facc15; background: #172033; }}
+	.alpr-popup {{ position: fixed; inset: 0; background: rgba(2, 6, 23, 0.72); display: none; align-items: center; justify-content: center; z-index: 1000; padding: 24px; }}
+	.alpr-popup.visible {{ display: flex; }}
+	.alpr-popup-card {{ width: min(92vw, 420px); background: #111827; border: 1px solid #334155; border-radius: 8px; padding: 22px; text-align: center; box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35); }}
+	.alpr-popup-card h2 {{ margin: 0; font-size: 1.1rem; }}
+	.alpr-popup-card p {{ margin: 10px 0 0; color: #cbd5e1; }}
+	.alpr-popup-close {{ margin-top: 14px; background: #facc15; color: #111827; border: 0; border-radius: 8px; padding: 9px 14px; cursor: pointer; font-weight: 700; }}
+	{self._render_shared_styles()}
 </style></head>
 <body>
 <div class="page-shell">
@@ -5713,18 +5857,68 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
 <input type="hidden" name="path" value="{escaped_relative_attr}">
 <button type="submit" class="alpr-icon-button" aria-label="Send to ALPR" title="Send to ALPR"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5.5 16a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Zm13 0a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Z"/><path d="M5 14h14l-1.2-4.1a2 2 0 0 0-1.92-1.43H8.12A2 2 0 0 0 6.2 9.9L5 14Zm15 1a1 1 0 0 1 1 1v3h-2v-1H5v1H3v-3a1 1 0 0 1 1-1h16ZM7.12 9.34A3 3 0 0 1 10 7h5a3 3 0 0 1 2.88 2.34L19.78 16H4.22l2.9-6.66Z"/></svg></button>
 <span style="color:#cbd5e1;">Send to ALPR</span>
-</form></div>
-</div>
-<script>
-(() => {{
-  const newer = {json.dumps(newer_link)};
-  const older = {json.dumps(older_link)};
+	</form></div>
+	</div>
+	<div class="alpr-popup" id="alpr-popup" role="dialog" aria-modal="true" aria-labelledby="alpr-popup-title">
+	  <div class="alpr-popup-card">
+	    <h2 id="alpr-popup-title">ALPR</h2>
+	    <p id="alpr-popup-message">Sending...</p>
+	    <button class="alpr-popup-close" id="alpr-popup-close" type="button">Close</button>
+	  </div>
+	</div>
+	<script>
+	(() => {{
+	  const newer = {json.dumps(newer_link)};
+	  const older = {json.dumps(older_link)};
   window.addEventListener('keydown', (event) => {{
     if (event.key === 'ArrowLeft' && newer) window.location.href = newer;
-    if (event.key === 'ArrowRight' && older) window.location.href = older;
-  }});
-}})();
-</script>
+	    if (event.key === 'ArrowRight' && older) window.location.href = older;
+	  }});
+	}})();
+	(() => {{
+	  const popup = document.getElementById('alpr-popup');
+	  const title = document.getElementById('alpr-popup-title');
+	  const message = document.getElementById('alpr-popup-message');
+	  const close = document.getElementById('alpr-popup-close');
+	  const form = document.querySelector('form.alpr-action[action="/api/images/alpr"]');
+	  if (!popup || !title || !message || !close || !form) return;
+
+	  function showPopup(heading, text) {{
+	    title.textContent = heading;
+	    message.textContent = text;
+	    popup.classList.add('visible');
+	  }}
+
+	  close.addEventListener('click', () => popup.classList.remove('visible'));
+	  popup.addEventListener('click', (event) => {{
+	    if (event.target === popup) popup.classList.remove('visible');
+	  }});
+
+	  form.addEventListener('submit', async (event) => {{
+	    event.preventDefault();
+	    const button = form.querySelector('button');
+	    if (button) button.disabled = true;
+	    showPopup('ALPR', 'Sending image...');
+	    try {{
+	      const formData = new FormData(form);
+	      const payload = {{}};
+	      formData.forEach((value, key) => {{ payload[key] = value; }});
+	      const response = await fetch(form.action, {{
+	        method: 'POST',
+	        headers: {{ 'Content-Type': 'application/json' }},
+	        body: JSON.stringify(payload),
+	      }});
+	      const data = await response.json();
+	      if (!response.ok) throw new Error(data.error || 'ALPR request failed');
+	      showPopup('ALPR Result', data.message || 'ALPR request completed.');
+	    }} catch (error) {{
+	      showPopup('ALPR Failed', error.message || 'ALPR request failed.');
+	    }} finally {{
+	      if (button) button.disabled = false;
+	    }}
+	  }});
+	}})();
+	</script>
 </body></html>""".encode("utf-8")
         handler.send_response(HTTPStatus.OK)
         handler.send_header("Content-Type", "text/html; charset=utf-8")
@@ -5763,8 +5957,7 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
         if selected_video is not None:
             selected_video_url = self._event_file_url(selected_relative)
             selected_player_html = (
-                f'<div class="player-card"><span class="eyebrow">Now Playing</span>'
-                f'<div class="player-wrap"><video id="gallery-video-player" controls preload="none" src="{selected_video_url}"></video>'
+                f'<div class="player-card"><div class="player-wrap"><video id="gallery-video-player" controls preload="none" src="{selected_video_url}"></video>'
                 f'<button id="gallery-video-fullscreen" class="player-overlay-button" type="button" aria-label="Fullscreen" title="Fullscreen">{fullscreen_icon}</button></div>'
                 f'<p class="player-path">{html.escape(selected_relative)}</p>'
                 f'<div class="player-links"><a href="{self._video_detail_url(selected_relative)}">Detail</a>'
@@ -5875,6 +6068,24 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
     close.style.display = 'none';
   }
 
+  function extractionErrorText(job) {
+    const parts = [
+      job.error_detail || job.error || 'Extraction failed.',
+      `Video: ${job.video || 'unknown'}`,
+      `Stage: ${job.stage || 'unknown'}`,
+      `Saved: ${job.saved || 0}/${job.total || '?'}`,
+    ];
+    if (job.current_position_seconds !== undefined) parts.push(`Last position: ${Number(job.current_position_seconds).toFixed(3)}s`);
+    if (job.duration_seconds !== undefined) parts.push(`Duration: ${Number(job.duration_seconds).toFixed(3)}s`);
+    return parts.filter(Boolean).join('\\n');
+  }
+
+  function extractionProgressText(job) {
+    const total = job.total || '?';
+    const attempt = job.attempt_index && job.attempt_total ? ` (attempt ${job.attempt_index}/${job.attempt_total})` : '';
+    return `Saved ${job.saved || 0} of ${total} images from ${job.video}${attempt}`;
+  }
+
   if (close) close.addEventListener('click', hideOverlay);
 
   playButtons.forEach((btn) => {
@@ -5884,7 +6095,7 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
       const playerStack = document.querySelector('.player-stack');
       if (!playerStack || !videoUrl) return;
       const fullscreenIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h5v2H7v3H5V5Zm12 0h2v5h-2V7h-3V5h3ZM5 14h2v3h3v2H5v-5Zm12 3v-3h2v5h-5v-2h3Z"/></svg>';
-      playerStack.innerHTML = `<div class="player-card"><span class="eyebrow">Now Playing</span><div class="player-wrap"><video id="gallery-video-player" controls preload="metadata" src="${videoUrl}"></video><button id="gallery-video-fullscreen" class="player-overlay-button" type="button" aria-label="Fullscreen" title="Fullscreen">${fullscreenIcon}</button></div><p class="player-path">${videoName}</p></div>`;
+      playerStack.innerHTML = `<div class="player-card"><div class="player-wrap"><video id="gallery-video-player" controls preload="metadata" src="${videoUrl}"></video><button id="gallery-video-fullscreen" class="player-overlay-button" type="button" aria-label="Fullscreen" title="Fullscreen">${fullscreenIcon}</button></div><p class="player-path">${videoName}</p></div>`;
       const newVideo = document.getElementById('gallery-video-player');
       if (newVideo) newVideo.play().catch(() => {});
       const fsBtn = document.getElementById('gallery-video-fullscreen');
@@ -5950,24 +6161,29 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
                 clearInterval(poll);
                 if (submitter) submitter.classList.remove('busy');
                 if (submitter) submitter.disabled = false;
-                if (statusEl) statusEl.textContent = 'Err';
-                if (overlay) setOverlayState('Extraction failed', job.error, true);
+                const errorText = extractionErrorText(job);
+                if (statusEl) {
+                  statusEl.textContent = 'Failed';
+                  statusEl.title = errorText;
+                }
+                if (overlay) setOverlayState('Extraction failed', errorText, true);
               } else if (job.done) {
                 clearInterval(poll);
                 if (submitter) submitter.classList.remove('busy');
                 if (submitter) submitter.disabled = false;
-                if (statusEl) statusEl.textContent = job.stage === 'cancelled' ? 'Stopped' : `${job.saved}`;
-                if (overlay) {
-                  if (job.stage === 'cancelled') {
-                    setOverlayState('Stopped', `Saved ${job.saved} images from ${job.video} before stopping.`, true);
-                  } else {
-                    setOverlayState('Done', `Saved ${job.saved} images from ${job.video}. Open the Images page to review them.`, true);
-                  }
-                }
-              } else {
-                const total = job.total || '?';
-                if (overlay) setOverlayState('Extracting images…', `Saved ${job.saved} of ${total} images from ${job.video}`, false);
-              }
+                if (statusEl) statusEl.textContent = job.stage === 'cancelled' ? 'Stopped' : (job.stage === 'partial' ? `${job.saved}/${job.total}` : `${job.saved}`);
+	                if (overlay) {
+	                  if (job.stage === 'cancelled') {
+	                    setOverlayState('Stopped', `Saved ${job.saved} images from ${job.video} before stopping.`, true);
+	                  } else if (job.stage === 'partial') {
+	                    setOverlayState('Partial extraction', job.warning || `Saved ${job.saved} of ${job.total} requested images from ${job.video}.`, true);
+	                  } else {
+	                    setOverlayState('Done', `Saved ${job.saved} images from ${job.video}. Open the Images page to review them.`, true);
+	                  }
+	                }
+	              } else {
+	                if (overlay) setOverlayState('Extracting images…', extractionProgressText(job), false);
+	              }
             } catch (e) {}
           }, 500);
         } else {

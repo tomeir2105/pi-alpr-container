@@ -63,6 +63,7 @@ class Config:
     prebuffer_frames: int
     postbuffer_frames: int
     upload_top_frames: int
+    manual_extract_image_count: int
     upload_min_sharpness: float
     event_output_dir: Path
     image_output_dir: Path
@@ -135,11 +136,12 @@ class Config:
             min_consecutive_hits=max(1, int(getenv("MIN_CONSECUTIVE_HITS", "3"))),
             event_idle_seconds=float(getenv("EVENT_IDLE_SECONDS", "1.5")),
             event_max_seconds=max(1.0, float(getenv("EVENT_MAX_SECONDS", "60.0"))),
-            prebuffer_seconds=float(getenv("PREBUFFER_SECONDS", "2.0")),
+            prebuffer_seconds=float(getenv("PREBUFFER_SECONDS", str(VIDEO_PREBUFFER_SECONDS))),
             postbuffer_seconds=float(getenv("POSTBUFFER_SECONDS", "5.0")),
             prebuffer_frames=max(0, int(getenv("PREBUFFER_FRAMES", "0"))),
             postbuffer_frames=max(0, int(getenv("POSTBUFFER_FRAMES", "0"))),
             upload_top_frames=max(1, int(getenv("UPLOAD_TOP_FRAMES", "240"))),
+            manual_extract_image_count=max(1, int(getenv("MANUAL_EXTRACT_IMAGE_COUNT", "20"))),
             upload_min_sharpness=float(getenv("UPLOAD_MIN_SHARPNESS", "80.0")),
             event_output_dir=event_output_dir,
             image_output_dir=image_output_dir,
