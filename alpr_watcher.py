@@ -3177,30 +3177,32 @@ class RtspVehicleWatcher:
       <button id="shared-extract-images" type="button" class="toggle-button" data-state="on" aria-label="Toggle video image extraction" title="Extract images from video" style="display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:999px;border:1px solid #4ade80;background:transparent;color:#4ade80;cursor:pointer;padding:0;"><svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor;"><path d="M17 7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h10c2.76 0 5-2.24 5-5s-2.24-5-5-5zm0 8c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3z"/></svg></button>
       <span>Extract images</span>
     </div>
+    <div style="display:flex; align-items:center; gap:12px; color:#cbd5e1;">
+      <button id="shared-fast-alpr" type="button" class="toggle-button" data-state="on" aria-label="Toggle Fast-ALPR" title="Fast-ALPR" style="display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:999px;border:1px solid #4ade80;background:transparent;color:#4ade80;cursor:pointer;padding:0;"><svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor;"><path d="M17 7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h10c2.76 0 5-2.24 5-5s-2.24-5-5-5zm0 8c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3z"/></svg></button>
+      <span>Fast-ALPR</span>
+    </div>
+    <div style="display:flex; align-items:center; gap:12px; color:#cbd5e1;">
+      <button id="shared-telegram" type="button" class="toggle-button" data-state="on" aria-label="Toggle Telegram sending" title="Send to Telegram" style="display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:999px;border:1px solid #4ade80;background:transparent;color:#4ade80;cursor:pointer;padding:0;"><svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor;"><path d="M17 7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h10c2.76 0 5-2.24 5-5s-2.24-5-5-5zm0 8c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3z"/></svg></button>
+      <span>Telegram</span>
+    </div>
   </div>
   <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px; margin-top:14px;">
     <div style="background:#0f172a; border:1px solid #334155; border-radius:8px; padding:12px;">
       <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
-        <button id="zone-select-yellow" type="button" style="background:#facc15; color:#111827; border:0; border-radius:8px; padding:8px 12px; cursor:pointer; font-weight:700;">Edit Yellow Zone</button>
+        <div style="display:flex; align-items:center; gap:10px;">
+          <button id="zone-select-yellow" type="button" aria-label="Edit Yellow zone" title="Edit Yellow zone" style="display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;background:#facc15; color:#111827; border:0; border-radius:999px; cursor:pointer; padding:0;"><svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor;"><path d="M4 17.25V20h2.75L17.8 8.95 15.05 6.2 4 17.25ZM19.7 7.05a1 1 0 0 0 0-1.4l-1.35-1.35a1 1 0 0 0-1.4 0l-1.05 1.05 2.75 2.75 1.05-1.05Z"/></svg></button>
+          <span style="color:#e2e8f0; font-weight:700;">Yellow zone</span>
+        </div>
         <label style="color:#e2e8f0;"><input id="zone-enabled-yellow" type="checkbox" checked> Enabled</label>
-      </div>
-      <div style="display:flex; align-items:center; gap:14px; margin-top:10px;">
-        <button id="zone-fast-alpr-yellow" type="button" class="toggle-button" data-state="on" aria-label="Toggle fast-alpr" title="Fast-ALPR" style="display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:999px;border:1px solid #4ade80;background:transparent;color:#4ade80;cursor:pointer;padding:0;"><svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor;"><path d="M17 7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h10c2.76 0 5-2.24 5-5s-2.24-5-5-5zm0 8c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3z"/></svg></button>
-        <span style="color:#cbd5e1;">Fast-ALPR</span>
-        <button id="zone-telegram-yellow" type="button" class="toggle-button" data-state="on" aria-label="Toggle Telegram" title="Telegram" style="display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:999px;border:1px solid #4ade80;background:transparent;color:#4ade80;cursor:pointer;padding:0;"><svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor;"><path d="M17 7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h10c2.76 0 5-2.24 5-5s-2.24-5-5-5zm0 8c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3z"/></svg></button>
-        <span style="color:#cbd5e1;">Telegram</span>
       </div>
     </div>
     <div style="background:#0f172a; border:1px solid #334155; border-radius:8px; padding:12px;">
       <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
-        <button id="zone-select-purple" type="button" style="background:#c084fc; color:#111827; border:0; border-radius:8px; padding:8px 12px; cursor:pointer; font-weight:700;">Edit Purple Zone</button>
+        <div style="display:flex; align-items:center; gap:10px;">
+          <button id="zone-select-purple" type="button" aria-label="Edit Purple zone" title="Edit Purple zone" style="display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;background:#c084fc; color:#111827; border:0; border-radius:999px; cursor:pointer; padding:0;"><svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor;"><path d="M4 17.25V20h2.75L17.8 8.95 15.05 6.2 4 17.25ZM19.7 7.05a1 1 0 0 0 0-1.4l-1.35-1.35a1 1 0 0 0-1.4 0l-1.05 1.05 2.75 2.75 1.05-1.05Z"/></svg></button>
+          <span style="color:#e2e8f0; font-weight:700;">Purple zone</span>
+        </div>
         <label style="color:#e2e8f0;"><input id="zone-enabled-purple" type="checkbox"> Enabled</label>
-      </div>
-      <div style="display:flex; align-items:center; gap:14px; margin-top:10px;">
-        <button id="zone-fast-alpr-purple" type="button" class="toggle-button" data-state="off" aria-label="Toggle fast-alpr" title="Fast-ALPR" style="display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:999px;border:1px solid #334155;background:transparent;color:#64748b;cursor:pointer;padding:0;"><svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor;"><path d="M17 7H7C4.24 7 2 9.24 2 12s2.24 5 5 5h10c2.76 0 5-2.24 5-5s-2.24-5-5-5zM7 15c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3z"/></svg></button>
-        <span style="color:#cbd5e1;">Fast-ALPR</span>
-        <button id="zone-telegram-purple" type="button" class="toggle-button" data-state="off" aria-label="Toggle Telegram" title="Telegram" style="display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:999px;border:1px solid #334155;background:transparent;color:#64748b;cursor:pointer;padding:0;"><svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor;"><path d="M17 7H7C4.24 7 2 9.24 2 12s2.24 5 5 5h10c2.76 0 5-2.24 5-5s-2.24-5-5-5zM7 15c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3z"/></svg></button>
-        <span style="color:#cbd5e1;">Telegram</span>
       </div>
     </div>
   </div>
