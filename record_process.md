@@ -4,7 +4,7 @@ This document describes what the watcher does when motion is detected, what can 
 
 ## Main Loop
 
-The watcher opens the configured `RTSP_URL` and continuously reads frames from the camera. Each frame is resized according to `FRAME_WIDTH`, pushed into an in-memory prebuffer, and used for the dashboard stream.
+The watcher opens the configured `RTSP_URL` and continuously reads original frames from the camera. Original frames are pushed into the in-memory prebuffer and video writer, while resized copies are used for motion detection and the dashboard stream.
 
 Motion analysis does not run on every captured frame. Normally it runs every `PROCESS_EVERY_N_FRAMES`. While a video recording is active, the watcher processes fewer motion frames to leave CPU available for ffmpeg:
 
@@ -152,9 +152,11 @@ record_seconds = max(record_seconds for triggered zones)
 
 If no matching zone is found, it falls back to the primary yellow zone or `VIDEO_RECORDING_SECONDS`.
 
-## Prebuffer
+## Video Prebuffer
 
-The watcher keeps a rolling prebuffer of recent frames. When recording starts, it copies frames whose timestamps are within:
+The watcher keeps a rolling prebuffer of recent original-resolution frames for motion-event context, fallback image handling, and video recording.
+
+The prebuffer window is:
 
 ```text
 PREBUFFER_FRAMES / fps_guess
@@ -170,19 +172,13 @@ To limit CPU and memory, the prebuffer frames written into the video are capped 
 
 ## Video Writer
 
-The watcher prefers ffmpeg when available. It starts ffmpeg as a subprocess and writes raw BGR frames to stdin:
+The watcher prefers ffmpeg when available. It starts ffmpeg as a subprocess and writes original frames from the main capture loop to stdin:
 
 ```text
-rawvideo bgr24 -> libx264 -> yuv420p MP4
+main capture frame bgr24 -> libx264 -> yuv420p MP4
 ```
 
-The ffmpeg output settings are:
-
-- codec: `libx264`
-- preset: `veryfast`
-- pixel format: `yuv420p`
-- `+faststart`
-- threads from `FFMPEG_THREADS`
+This uses the already-open camera stream and does not open a second RTSP stream for recording. Automatic and manual image extraction are held until no video recording is active.
 
 If ffmpeg is unavailable, it falls back to OpenCV `VideoWriter` with `mp4v`.
 
@@ -193,10 +189,8 @@ Writes go through `QueuedVideoWriter`, which keeps a bounded queue so the captur
 The recording FPS is chosen from measured processing FPS or camera FPS guess:
 
 ```text
-fps = max(5.0, min(MAX_RECORDING_FPS, processing_fps or fps_guess))
+fps = max(5.0, min(60.0, fps_guess or processing_fps or 20.0))
 ```
-
-`MAX_RECORDING_FPS` is currently `15.0`.
 
 When appending frames, the watcher may duplicate the latest frame to keep the output timeline close to the target FPS. It caps catch-up writes to at most five seconds of frames at a time.
 
@@ -266,4 +260,3 @@ If the finalized event uses Fast-ALPR, the event is queued on the associated rec
 If Fast-ALPR is disabled for the triggered zone, the motion event still records video, but automatic image creation is skipped.
 
 Manual image extraction from saved videos is still available from the Videos page.
-

@@ -10,3 +10,4 @@ if [ -z "$cid" ]; then
 fi
 
 docker stop "$cid" && echo "Container ${CONTAINER} stopped successfully"
+docker image prune -f

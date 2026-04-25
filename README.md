@@ -111,12 +111,12 @@ When the watcher is running, open:
 ## Tuning
 
 - `ROI` should cover only the driveway or road where cars pass.
-- The watcher now uses a single camera stream for motion detection, dashboard live view, image creation, and local video recording.
+- The watcher pulls one camera stream, keeps original frames for the recording prebuffer, and uses resized copies only for motion detection and dashboard live view.
 - `PLATE_ROI` can be a tighter sub-zone where plates are expected to appear; this crops frames before ALPR runs.
-- `FRAME_WIDTH=960` keeps processing, streaming, and recordings bounded. Use `0` only if the host has enough CPU/RAM for the camera's native resolution.
+- `FRAME_WIDTH=960` keeps processing and dashboard streaming bounded. It does not downscale saved motion clips.
 - `MIN_MOTION_AREA` filters out tiny motion like rain, trees, and shadows.
 - `MIN_CONSECUTIVE_HITS` helps avoid one-frame false triggers.
-- `PREBUFFER_SECONDS` keeps video from before the trigger. The default is 10 seconds.
+- `PREBUFFER_SECONDS` keeps original-resolution video frames from before the trigger.
 - `POSTBUFFER_SECONDS` keeps video after the last motion.
 - `PREBUFFER_FRAMES` overrides `PREBUFFER_SECONDS` if you prefer an exact frame count.
 - `POSTBUFFER_FRAMES` overrides `POSTBUFFER_SECONDS` if you prefer an exact frame count.
@@ -230,7 +230,7 @@ Motion-triggered MP4 recordings and uploaded videos are stored separately under:
 /mnt/localdisk/pi-alpr/events/videos/
 ```
 
-MP4 recordings are written locally on the Pi through `ffmpeg` as H.264/yuv420p files and are first stored under `events/videos/recording-tmp/`. They move into the main videos directory only after the recording is closed cleanly.
+MP4 recordings are written locally on the Pi through `ffmpeg` from the original frames already read by the main capture loop. Files are first stored under `events/videos/recording-tmp/` and move into the main videos directory only after the recording is closed cleanly.
 
 Docker image layers and container metadata are controlled by the Docker daemon storage location, usually `/var/lib/docker`. Move Docker's `data-root` to `/mnt/localdisk` at the host level if those must also avoid the OS disk.
 

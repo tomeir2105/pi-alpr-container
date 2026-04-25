@@ -33,7 +33,6 @@ from alpr_models import (
     FILE_STREAM_CHUNK_SIZE,
     GALLERY_PAGE_SIZE,
     MAX_IMAGE_UPLOAD_BYTES,
-    MAX_RECORDING_FPS,
     MAX_VIDEO_PREBUFFER_FRAMES,
     MIN_ALLOWED_MOTION_AREA,
     MotionZone,
@@ -509,7 +508,7 @@ class RtspVehicleWatcher:
                         raise RuntimeError("Failed to read frame from RTSP stream")
                     timestamp = time.time()
                     self._record_capture_frame(timestamp)
-                    replace_captured_frame((timestamp, self._resize_frame(captured_frame)))
+                    replace_captured_frame((timestamp, captured_frame))
             except Exception as exc:
                 if capture_error.empty():
                     capture_error.put_nowait(exc)
@@ -523,7 +522,7 @@ class RtspVehicleWatcher:
                 if reader_error is not None:
                     raise RuntimeError("RTSP reader failed") from reader_error
                 try:
-                    timestamp, frame = frame_queue.get(timeout=2.0)
+                    timestamp, original_frame = frame_queue.get(timeout=2.0)
                     frame_queue.task_done()
                 except queue.Empty:
                     reader_error = current_capture_error()
@@ -531,7 +530,8 @@ class RtspVehicleWatcher:
                         raise RuntimeError("RTSP reader failed") from reader_error
                     raise RuntimeError("Timed out waiting for frame from RTSP reader")
 
-                self._push_prebuffer(timestamp, frame)
+                frame = self._resize_frame(original_frame)
+                self._push_prebuffer(timestamp, original_frame)
 
                 # During active recording, process fewer frames to free CPU for ffmpeg
                 process_interval = self.config.process_every_n_frames * 3 if self.video_recording is not None else self.config.process_every_n_frames
@@ -634,13 +634,13 @@ class RtspVehicleWatcher:
                                 f"Confirmed motion for zones={','.join(sorted(triggered_zone_ids)) or 'unknown'}",
                                 zone_id=self._primary_zone_id_for(triggered_zone_ids),
                             )
-                    self._on_motion(timestamp, frame, motion_area, triggered_zone_ids)
+                    self._on_motion(timestamp, original_frame, motion_area, triggered_zone_ids)
                 elif self.event:
-                    self._append_event_frame(timestamp, frame, count_as_postbuffer=True)
+                    self._append_event_frame(timestamp, original_frame, count_as_postbuffer=True)
                     if self._event_ready_to_finalize(timestamp):
                         self._finalize_event("motion idle and postbuffer complete")
 
-                self._append_video_recording_frame(timestamp, frame)
+                self._append_video_recording_frame(timestamp, original_frame)
 
                 self.frame_index += 1
                 self._record_processing_frame()
@@ -825,7 +825,7 @@ class RtspVehicleWatcher:
         frame_size = (width, height)
         with self.stats_lock:
             processing_fps = self._rolling_fps(deque(self.processing_frame_times))
-        fps = max(5.0, min(MAX_RECORDING_FPS, processing_fps or self.fps_guess))
+        fps = max(5.0, min(60.0, self.fps_guess or processing_fps or 20.0))
         if shutil.which("ffmpeg"):
             raw_writer = FfmpegVideoWriter(temp_output_path, fps, frame_size, self.config.ffmpeg_threads)
         else:
@@ -872,16 +872,18 @@ class RtspVehicleWatcher:
             confirmed=confirmed,
         )
         status = "confirmed motion" if confirmed else "motion warning"
+        recording_mode = "main capture original frames"
         logging.info(
-            "Started %.0f-second video recording at %s on %s for zones=%s",
+            "Started %.0f-second video recording at %s on %s for zones=%s using %s",
             record_seconds,
             output_path,
             status,
             ",".join(sorted(triggered_zone_ids)) or "unknown",
+            recording_mode,
         )
         self._add_event_log(
             "video",
-            f"Started local video {output_path.name} for {int(round(record_seconds))}s on {status} for zones={','.join(sorted(triggered_zone_ids)) or 'unknown'}",
+            f"Started local video {output_path.name} for {int(round(record_seconds))}s on {status} using {recording_mode} for zones={','.join(sorted(triggered_zone_ids)) or 'unknown'}",
             zone_id=vid_zone_id,
         )
 
@@ -1269,6 +1271,7 @@ class RtspVehicleWatcher:
                     "camera_name": self.config.camera_name,
                     "video_path": str(recording.output_path),
                     "source": "capture-stream",
+                    "recording_mode": "main_capture_original_frames",
                     "started_at_epoch": recording.started_at,
                     "first_frame_at_epoch": recording.first_frame_at,
                     "ends_at_epoch": recording.ends_at,
@@ -1746,11 +1749,15 @@ class RtspVehicleWatcher:
 
     def _save_finalized_event(self, event: Event, reason: str) -> None:
         try:
+            while self.video_recording is not None:
+                time.sleep(0.5)
             self._save_finalized_event_unchecked(event, reason)
         except Exception:
             logging.exception("Failed to save finalized event: %s", reason)
 
     def _save_video_events(self, recording: VideoRecording) -> None:
+        while self.video_recording is not None:
+            time.sleep(0.5)
         for event in list(recording.pending_events):
             event_zone_id = self._primary_zone_id_for(event.zones_triggered)
             try:
@@ -1765,6 +1772,18 @@ class RtspVehicleWatcher:
             except Exception:
                 logging.exception("Failed to extract event images from %s", recording.output_path)
                 self._add_event_log("image", f"Failed extracting images from {recording.output_path.name}", zone_id=event_zone_id)
+
+    def _send_recording_active_extraction_error(self, handler: BaseHTTPRequestHandler) -> None:
+        body = json.dumps(
+            {
+                "error": "A video is still being recorded. Image extraction is available after the recording is saved.",
+            }
+        ).encode("utf-8")
+        handler.send_response(HTTPStatus.CONFLICT)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
 
     def _save_finalized_event_unchecked(
         self,
@@ -3320,8 +3339,12 @@ class RtspVehicleWatcher:
         return """
 :root { color-scheme: dark; }
 * { box-sizing: border-box; }
-body { min-height: 100vh; background: #07110f; color: #edf7f2; padding: 0; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+body { min-height: 100vh; background: #07110f; color: #edf7f2; padding: 0; overflow-x: hidden; }
 a { color: #7dd3fc; }
+img, video, canvas, svg { max-width: 100%; }
+button, input, select, textarea { font: inherit; max-width: 100%; }
+button, a, input, select, textarea { touch-action: manipulation; }
 .page-shell { width: min(1380px, calc(100% - 32px)); margin: 0 auto; padding: 22px 0 34px; }
 .topbar { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 24px; padding: 12px 14px; background: rgba(9, 18, 17, 0.92); border: 1px solid #24413c; border-radius: 8px; box-shadow: 0 14px 40px rgba(0, 0, 0, 0.28); }
 .brand { color: #f8fafc; font-weight: 800; text-decoration: none; letter-spacing: 0; white-space: nowrap; }
@@ -3353,14 +3376,30 @@ a { color: #7dd3fc; }
 .panel, .card { border: 1px solid #263d39; box-shadow: 0 10px 28px rgba(0, 0, 0, 0.2); }
 h1 { margin-top: 0; }
 @media (max-width: 760px) {
-  .page-shell { width: min(100% - 20px, 1380px); padding-top: 10px; }
-  .topbar { align-items: flex-start; flex-direction: column; }
-  .nav-links { justify-content: flex-start; }
-  .nav-links a { padding: 9px 10px; }
-  .topbar-status { justify-content: flex-start; }
+  h1 { font-size: clamp(1.55rem, 8vw, 2rem); line-height: 1.12; overflow-wrap: anywhere; }
+  h2 { font-size: clamp(1.15rem, 6vw, 1.45rem); line-height: 1.18; }
+  p, li { line-height: 1.45; }
+  .page-shell { width: min(100% - 20px, 1380px); padding-top: 10px; padding-bottom: 24px; }
+  .topbar { align-items: stretch; flex-direction: column; gap: 12px; margin-bottom: 18px; padding: 10px; }
+  .brand { white-space: normal; line-height: 1.2; }
+  .nav-links { justify-content: flex-start; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .nav-links a { display: flex; align-items: center; justify-content: center; min-height: 42px; padding: 9px 10px; text-align: center; }
+  .topbar-status { justify-content: flex-start; align-items: stretch; }
   .system-clock, .extraction-indicator { padding: 9px 10px; }
-  .menu-actions { justify-content: flex-start; }
-  .menu-actions button { padding: 9px 10px; }
+  .menu-actions { justify-content: flex-start; align-items: stretch; }
+  .menu-actions button { min-height: 42px; padding: 9px 10px; }
+  .panel, .card { padding: 14px; border-radius: 8px; }
+  .grid, .gallery, .stats-grid { grid-template-columns: 1fr !important; gap: 12px; }
+  .pagination { gap: 8px; }
+  .pagination a, .pagination span { flex: 1 1 auto; text-align: center; }
+  .detail-actions, .page-actions, .config-actions, .time-tools, .video-tools, .card-actions, .alpr-action { align-items: stretch; }
+  .detail-actions a:not(.icon-button), .page-action, .telegram-action, .danger-action, .config-actions button, .time-tools button, .video-tools button { width: 100%; justify-content: center; }
+  .env-editor { min-height: 52vh; font-size: 13px; }
+  pre { max-width: 100%; overflow-x: auto; }
+}
+@media (max-width: 420px) {
+  .page-shell { width: min(100% - 14px, 1380px); }
+  .nav-links { grid-template-columns: 1fr; }
 }
 """
 
@@ -3513,7 +3552,6 @@ h1 { margin-top: 0; }
 (() => {{
   const uploadBtn = document.getElementById('video-upload-btn');
   const uploadInput = document.getElementById('video-upload-input');
-  const doubleConfirmForms = Array.from(document.querySelectorAll('form[data-double-confirm]'));
 
   function armDoubleConfirm(form) {{
     const button = form && form.querySelector('button[type="submit"], button:not([type])');
@@ -3529,21 +3567,31 @@ h1 { margin-top: 0; }
     delete form.dataset.confirmArmed;
   }}
 
+  function resetDeleteConfirmButtons(exceptForm) {{
+    Array.from(document.querySelectorAll('form[data-double-confirm]')).forEach((form) => {{
+      if (form !== exceptForm) resetDoubleConfirm(form);
+    }});
+  }}
+
+  window.__resetDeleteConfirmButtons = resetDeleteConfirmButtons;
+
+  document.addEventListener('click', (event) => {{
+    const control = event.target.closest('button, a, input[type="button"], input[type="submit"]');
+    if (!control) return;
+    const armedForm = control.closest('form[data-double-confirm]');
+    if (armedForm && armedForm.dataset.confirmArmed === 'true') return;
+    resetDeleteConfirmButtons(null);
+  }});
+
+  const doubleConfirmForms = Array.from(document.querySelectorAll('form[data-double-confirm]'));
   doubleConfirmForms.forEach((form) => {{
     const button = form.querySelector('button[type="submit"], button:not([type])');
     if (!button) return;
     form.addEventListener('submit', (event) => {{
       if (form.dataset.confirmArmed === 'true') return;
       event.preventDefault();
-      doubleConfirmForms.forEach((otherForm) => {{
-        if (otherForm !== form) resetDoubleConfirm(otherForm);
-      }});
+      resetDeleteConfirmButtons(form);
       armDoubleConfirm(form);
-    }});
-    button.addEventListener('blur', () => {{
-      window.setTimeout(() => {{
-        if (!form.contains(document.activeElement)) resetDoubleConfirm(form);
-      }}, 0);
     }});
   }});
 
@@ -3719,7 +3767,7 @@ h1 { margin-top: 0; }
         gallery = self._render_image_cards(self._list_saved_images()[:8])
         event_log = self._render_event_log_items()
         return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>ALPR Watcher</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>ALPR Watcher</title>
 <style>
 body {{ font-family: Arial, sans-serif; background: #020617; color: #f8fafc; margin: 0; padding: 24px; }}
 a {{ color: #93c5fd; }}
@@ -3732,7 +3780,7 @@ a {{ color: #93c5fd; }}
 .stream {{ width: 100%; border-radius: 14px; display: block; border: 1px solid #334155; }}
 .section-title {{ margin: 0 0 14px; font-size: 1.2rem; }}
 .plates {{ display: grid; gap: 12px; }}
-.gallery {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }}
+.gallery {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 14px; }}
 .gallery .card {{ background: #0f172a; border-radius: 12px; padding: 12px; }}
 .gallery img {{ width: 100%; border-radius: 10px; display: block; }}
 .card {{ background: #0f172a; border-radius: 12px; padding: 14px; }}
@@ -3752,6 +3800,7 @@ a {{ color: #93c5fd; }}
   .event-log-item {{ grid-template-columns: 110px 80px minmax(0, 1fr); }}
 }}
 @media (max-width: 640px) {{
+  .hero {{ align-items: flex-start; }}
   .event-log-item {{ grid-template-columns: 1fr; }}
 }}
 {self._render_shared_styles()}
@@ -3823,22 +3872,20 @@ a {{ color: #93c5fd; }}
     def _render_live_page(self) -> str:
         live_preview_url = json.dumps("/stream-clean.mjpg")
         return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Live Video</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Live Video</title>
 <style>
 {self._render_shared_styles()}
 html, body {{ margin: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }}
 body {{ padding: 0; }}
-.page-shell {{ width: 100%; height: 100vh; margin: 0; padding: 0; }}
-.topbar {{ position: fixed; top: 12px; left: 12px; right: 12px; z-index: 5; margin: 0; }}
-.live-frame {{ position: fixed; top: 88px; left: 0; right: 0; bottom: 0; background: #000; overflow: hidden; }}
-.live-frame img {{ position: absolute; left: 50%; top: 50%; width: 100vw; height: calc(100vh - 88px); object-fit: contain; display: block; background: #000; transform: translate(-50%, -50%); transform-origin: center; }}
-.live-frame.vertical img {{ width: calc(100vh - 88px); height: 100vw; transform: translate(-50%, -50%) rotate(90deg); }}
+.page-shell {{ width: 100%; height: 100dvh; margin: 0; padding: 12px; display: flex; flex-direction: column; gap: 12px; }}
+.topbar {{ flex-shrink: 0; z-index: 5; margin: 0; }}
+.live-frame {{ position: relative; flex: 1; min-height: 0; background: #000; overflow: hidden; }}
+.live-frame img {{ position: absolute; left: 50%; top: 50%; width: 100%; height: 100%; object-fit: contain; display: block; background: #000; transform: translate(-50%, -50%); transform-origin: center; }}
+.live-frame.vertical img {{ width: 100dvh; height: 100vw; transform: translate(-50%, -50%) rotate(90deg); }}
 .live-error {{ position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); z-index: 6; padding: 10px 14px; border-radius: 999px; background: rgba(15, 23, 42, 0.88); color: #f8fafc; border: 1px solid rgba(148, 163, 184, 0.4); }}
 @media (max-width: 760px) {{
-  .topbar {{ top: 8px; left: 8px; right: 8px; }}
-  .live-frame {{ top: 76px; }}
-  .live-frame img {{ height: calc(100vh - 76px); }}
-  .live-frame.vertical img {{ width: calc(100vh - 76px); }}
+  .page-shell {{ padding: 8px; gap: 8px; }}
+  .topbar {{ max-height: 44dvh; overflow: auto; }}
 }}
 </style></head>
 <body>
@@ -3910,7 +3957,7 @@ body {{ padding: 0; }}
         escaped_env_path = html.escape(str(env_path))
         stats_json = html.escape(json.dumps(self._stats_snapshot(), indent=2))
         return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Configuration</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Configuration</title>
 <style>
 body {{ font-family: Arial, sans-serif; background: #07110f; color: #edf7f2; margin: 0; padding: 24px; }}
 a {{ color: #7dd3fc; }}
@@ -4161,11 +4208,11 @@ pre {{ white-space: pre-wrap; word-break: break-word; background: #050c0b; paddi
         pagination = self._pagination_html("/images", page, total_images, GALLERY_PAGE_SIZE)
         summary = self._gallery_summary_html(page, total_images, GALLERY_PAGE_SIZE, "images")
         return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Captured Images</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Captured Images</title>
 <style>
 body {{ font-family: Arial, sans-serif; background: #020617; color: #e2e8f0; margin: 0; padding: 24px; }}
 a {{ color: #93c5fd; }}
-.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; }}
+.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr)); gap: 18px; }}
 .card {{ background: #111827; padding: 12px; border-radius: 14px; }}
 .card-actions {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 8px; }}
 .card-filename {{ margin: 0; flex: 1; min-width: 0; }}
@@ -4279,7 +4326,7 @@ p {{ margin: 8px 0 0; word-break: break-word; }}
         )
         summary = self._gallery_summary_html(page, total_videos, GALLERY_PAGE_SIZE, "videos")
         return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Saved Videos</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Saved Videos</title>
 <style>
 body {{ font-family: Arial, sans-serif; background: #020617; color: #e2e8f0; margin: 0; padding: 24px; }}
 a {{ color: #93c5fd; }}
@@ -4287,7 +4334,7 @@ a {{ color: #93c5fd; }}
 .hero {{ display: flex; align-items: end; justify-content: space-between; gap: 18px; flex-wrap: wrap; margin-bottom: 8px; }}
 .hero h1 {{ margin: 0; font-size: clamp(1.8rem, 3vw, 2.6rem); letter-spacing: -0.03em; }}
 .hero p {{ margin: 6px 0 0; color: #94a3b8; max-width: 680px; }}
-	.video-layout {{ display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(320px, 0.9fr); gap: 18px; align-items: start; }}
+	.video-layout {{ display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(min(320px, 100%), 0.9fr); gap: 18px; align-items: start; }}
 	.player-stack {{ display: grid; gap: 18px; }}
 .player-card, .card {{ background: linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(10, 15, 29, 0.96)); padding: 18px; border-radius: 18px; border: 1px solid rgba(71, 85, 105, 0.42); box-shadow: 0 22px 50px rgba(0, 0, 0, 0.28); }}
 .video-list {{ display: grid; gap: 12px; margin-top: 16px; }}
@@ -4306,6 +4353,7 @@ a {{ color: #93c5fd; }}
 .video-icon-button svg {{ width: 18px; height: 18px; fill: currentColor; display: block; }}
 .video-icon-button:hover {{ border-color: #facc15; color: #facc15; background: #172033; }}
 .video-icon-button.danger:hover {{ border-color: #f87171; color: #f87171; background: #2b1520; }}
+.video-icon-button.confirm-armed, .video-icon-button.danger.confirm-armed, .video-icon-button.danger.confirm-armed:hover {{ border-color: #facc15; color: #111827; background: #facc15; }}
 .video-icon-button.busy {{ border-color: #38bdf8; color: #38bdf8; background: #0f172a; }}
 .video-action-status {{ min-height: 10px; color: #38bdf8; font-size: 0.68rem; font-variant-numeric: tabular-nums; line-height: 1; text-align: center; white-space: nowrap; }}
 .player-card {{ position: sticky; top: 18px; }}
@@ -4339,6 +4387,13 @@ a {{ color: #93c5fd; }}
 p {{ margin: 8px 0 0; word-break: break-word; }}
 @media (max-width: 960px) {{ .video-layout {{ grid-template-columns: 1fr; }} .player-card {{ position: static; }} }}
 @media (max-width: 720px) {{ .video-row {{ grid-template-columns: 1fr; }} .video-actions {{ justify-content: flex-start; }} }}
+@media (max-width: 520px) {{
+  .hero {{ align-items: flex-start; }}
+  .video-actions {{ display: grid; grid-template-columns: repeat(5, minmax(34px, 1fr)); justify-content: stretch; }}
+  .video-action-slot {{ width: 100%; }}
+  .video-icon-button {{ margin: 0 auto; }}
+  .player-wrap video, .live-wrap img {{ max-height: 52vh; }}
+}}
 {self._render_shared_styles()}
 </style></head>
 <body>
@@ -4365,11 +4420,11 @@ p {{ margin: 8px 0 0; word-break: break-word; }}
     def _render_plates_page(self) -> str:
         cards = self._render_recent_plate_cards(limit=100)
         return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Detected Plates</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Detected Plates</title>
 <style>
 body {{ font-family: Arial, sans-serif; background: #020617; color: #e2e8f0; margin: 0; padding: 24px; }}
 a {{ color: #93c5fd; }}
-.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 18px; }}
+.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr)); gap: 18px; }}
 .card {{ background: #111827; padding: 14px; border-radius: 14px; }}
 .card img {{ width: 100%; border-radius: 10px; display: block; margin-top: 10px; }}
 .plate-code {{ font-size: 1.4rem; font-weight: 700; letter-spacing: 0.08em; }}
@@ -4397,13 +4452,14 @@ a {{ color: #93c5fd; }}
 
     def _render_test_page(self) -> str:
         return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Test Upload</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Test Upload</title>
 <style>
 body {{ font-family: Arial, sans-serif; background: #020617; color: #e2e8f0; margin: 0; padding: 24px; }}
 a {{ color: #93c5fd; }}
 .panel {{ background: #111827; border: 1px solid #1f2937; border-radius: 18px; padding: 18px; max-width: 760px; }}
 label {{ display: block; margin-bottom: 10px; color: #cbd5e1; }}
 input[type=file] {{ display: block; margin-top: 8px; color: #e2e8f0; }}
+input[type=file] {{ width: 100%; }}
 button {{ margin-top: 14px; background: #2563eb; color: white; border: 0; border-radius: 10px; padding: 10px 16px; cursor: pointer; }}
 button.telegram {{ background: #facc15; color: #111827; }}
 code {{ background: #0f172a; padding: 2px 6px; border-radius: 6px; }}
@@ -4448,7 +4504,7 @@ code {{ background: #0f172a; padding: 2px 6px; border-radius: 6px; }}
             for item in detections
         ) or "<li>No plates detected.</li>"
         return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Test Upload Result</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Test Upload Result</title>
 <style>
 body {{ font-family: Arial, sans-serif; background: #020617; color: #e2e8f0; margin: 0; padding: 24px; }}
 a {{ color: #93c5fd; }}
@@ -4503,7 +4559,7 @@ ul {{ padding-left: 20px; }}
         ) or "<li>No plates detected.</li>"
         result_text = json.dumps(result, indent=2)
         return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>ALPR Image Check</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>ALPR Image Check</title>
 <style>
 body {{ font-family: Arial, sans-serif; background: #020617; color: #e2e8f0; margin: 0; padding: 24px; }}
 a {{ color: #93c5fd; }}
@@ -4533,7 +4589,7 @@ pre {{ white-space: pre-wrap; word-break: break-word; background: #0f172a; paddi
 
     def _render_saved_image_fast_alpr_error_page(self, message: str) -> str:
         return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>ALPR Image Check Failed</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>ALPR Image Check Failed</title>
 <style>
 body {{ font-family: Arial, sans-serif; background: #020617; color: #e2e8f0; margin: 0; padding: 24px; }}
 a {{ color: #93c5fd; }}
@@ -5009,7 +5065,7 @@ a {{ color: #93c5fd; }}
         escaped_message = html.escape(message)
         status_text = "Telegram Test Sent" if ok else "Telegram Test Failed"
         body = f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>{status_text}</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{status_text}</title>
 <style>
 body {{ font-family: Arial, sans-serif; background: #020617; color: #e2e8f0; margin: 0; padding: 24px; }}
 a {{ color: #93c5fd; }}
@@ -5144,6 +5200,9 @@ a {{ color: #93c5fd; }}
 
     def _handle_video_snapshot_fast_alpr(self, handler: BaseHTTPRequestHandler) -> None:
         try:
+            if self.video_recording is not None:
+                self._send_recording_active_extraction_error(handler)
+                return
             if not self.config.fast_alpr_url:
                 raise ValueError("FAST_ALPR_URL is not configured")
             fields, files = self._read_multipart_form(handler)
@@ -5364,6 +5423,9 @@ a {{ color: #93c5fd; }}
 
     def _handle_video_extract_images(self, handler: BaseHTTPRequestHandler) -> None:
         try:
+            if self.video_recording is not None:
+                self._send_recording_active_extraction_error(handler)
+                return
             form = self._read_simple_form(handler)
             relative_path = str(form.get("path") or "")
             video_path = self._saved_video_path_from_relative(relative_path)
@@ -5596,6 +5658,9 @@ a {{ color: #93c5fd; }}
 
     def _handle_video_quick_alpr(self, handler: BaseHTTPRequestHandler) -> None:
         try:
+            if self.video_recording is not None:
+                self._send_recording_active_extraction_error(handler)
+                return
             if not self.config.fast_alpr_url:
                 raise ValueError("FAST_ALPR_URL is not configured")
             relative_path = self._read_simple_form_value(handler, "path")
@@ -5823,7 +5888,7 @@ a {{ color: #93c5fd; }}
         )
         escaped_relative_attr = html.escape(relative, quote=True)
         body = f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Captured Image</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Captured Image</title>
 <style>
 body {{ font-family: Arial, sans-serif; background: #020617; color: #e2e8f0; margin: 0; padding: 24px; }}
 a {{ color: #93c5fd; }}
@@ -5845,6 +5910,11 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
 	.alpr-popup-card h2 {{ margin: 0; font-size: 1.1rem; }}
 	.alpr-popup-card p {{ margin: 10px 0 0; color: #cbd5e1; }}
 	.alpr-popup-close {{ margin-top: 14px; background: #facc15; color: #111827; border: 0; border-radius: 8px; padding: 9px 14px; cursor: pointer; font-weight: 700; }}
+@media (max-width: 520px) {{
+  .detail-actions {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }}
+  .detail-actions .icon-button {{ width: 100%; }}
+  .alpr-action {{ align-items: center; }}
+}}
 	{self._render_shared_styles()}
 </style></head>
 <body>
@@ -6121,7 +6191,8 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
         ? form.nextElementSibling
         : null;
       if (form.dataset.doubleConfirm && form.dataset.confirmArmed !== 'true') {
-        forms.forEach((otherForm) => {
+        if (window.__resetDeleteConfirmButtons) window.__resetDeleteConfirmButtons(form);
+        else forms.forEach((otherForm) => {
           if (otherForm !== form) resetDoubleConfirm(otherForm);
         });
         armDoubleConfirm(form, submitter);
@@ -6198,14 +6269,6 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
         if (submitter && !form.action.includes('/api/videos/extract-images')) submitter.classList.remove('busy');
       }
     });
-    const submitter = form.querySelector('button');
-    if (submitter) {
-      submitter.addEventListener('blur', () => {
-        window.setTimeout(() => {
-          if (!form.contains(document.activeElement)) resetDoubleConfirm(form);
-        }, 0);
-      });
-    }
   });
 })();
 </script>"""
@@ -6226,7 +6289,7 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
         relative = self._relative_video_path(video_path)
         video_url = self._event_file_url(relative)
         body = f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Saved Video</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Saved Video</title>
 <style>
 body {{ font-family: Arial, sans-serif; background: #020617; color: #e2e8f0; margin: 0; padding: 24px; }}
 a {{ color: #93c5fd; }}

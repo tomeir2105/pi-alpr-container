@@ -12,7 +12,6 @@ MIN_ALLOWED_MOTION_AREA = 500
 VIDEO_PREBUFFER_SECONDS = 10.0
 VIDEO_RECORDING_SECONDS = 180.0
 DEFAULT_FRAME_WIDTH = 960
-MAX_RECORDING_FPS = 15.0
 MAX_VIDEO_PREBUFFER_FRAMES = 150
 VIDEO_WRITER_QUEUE_SECONDS = 3.0
 DEFAULT_RTSP_CAPTURE_OPTIONS = "rtsp_transport;tcp|max_delay;2000000|stimeout;10000000"
@@ -49,7 +48,6 @@ def redact_url_credentials(value: str) -> str:
 @dataclass
 class Config:
     rtsp_url: str
-    alpr_rtsp_url: str
     secret_key: str
     country: str
     frame_width: int
@@ -127,7 +125,6 @@ class Config:
 
         return cls(
             rtsp_url=rtsp_url,
-            alpr_rtsp_url=getenv("ALPR_RTSP_URL").strip(),
             secret_key=secret_key,
             country=getenv("OPENALPR_COUNTRY", "us").strip(),
             frame_width=int(getenv("FRAME_WIDTH", str(DEFAULT_FRAME_WIDTH))),
