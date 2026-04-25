@@ -45,6 +45,7 @@ from alpr_models import (
     redact_url_credentials,
 )
 from alpr_services import (
+    DirectRtspVideoWriter,
     FfmpegVideoWriter,
     HikvisionMotionEventStream,
     OpenAlprClient,
@@ -62,6 +63,7 @@ class RtspVehicleWatcher:
         self.client = OpenAlprClient(config)
         self.camera_motion_stream = HikvisionMotionEventStream(config)
         self.camera_motion_config_lock = threading.Lock()
+        self.camera_motion_config_applied = False
         self.camera_motion_refresh_stop = threading.Event()
         self.camera_motion_refresh_thread: Optional[threading.Thread] = None
         self.prebuffer: Deque[Tuple[float, Any]] = deque(maxlen=max(500, int(MAX_VIDEO_PREBUFFER_FRAMES * 2)))
@@ -83,6 +85,9 @@ class RtspVehicleWatcher:
         self.alpr_capture_lock = threading.Lock()
         self.event_log_lock = threading.Lock()
         self.event_log: Deque[dict[str, Any]] = deque(maxlen=100)
+        self.event_log_path = Path(
+            os.getenv("EVENT_LOG_FILE", str(config.event_output_dir.parent / "logs" / "event-log.jsonl"))
+        ).expanduser()
         self.frame_index = 0
         self.fps_guess = 12.0
         self.capture = None
@@ -91,6 +96,9 @@ class RtspVehicleWatcher:
         self.config.event_output_dir.mkdir(parents=True, exist_ok=True)
         self.config.image_output_dir.mkdir(parents=True, exist_ok=True)
         self.config.video_output_dir.mkdir(parents=True, exist_ok=True)
+        self.event_log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._load_event_log()
+        self._add_event_log("system", f"Watcher started for {self.config.camera_name}")
         self.frame_lock = threading.Condition()
         self.latest_frame_jpeg: Optional[bytes] = None
         self.latest_clean_frame_jpeg: Optional[bytes] = None
@@ -135,6 +143,7 @@ class RtspVehicleWatcher:
                 enabled=True,
                 use_fast_alpr=True,
                 send_telegram=self.config.telegram_alerts_enabled,
+                extract_images=False,
                 record_seconds=max(1.0, VIDEO_RECORDING_SECONDS),
                 image_count=max(1, self.config.upload_top_frames),
                 coverage_trigger_percent=0.0,
@@ -149,6 +158,7 @@ class RtspVehicleWatcher:
                 enabled=True,
                 use_fast_alpr=True,
                 send_telegram=self.config.telegram_alerts_enabled,
+                extract_images=False,
                 record_seconds=max(1.0, VIDEO_RECORDING_SECONDS),
                 image_count=max(1, self.config.upload_top_frames),
                 coverage_trigger_percent=50.0,
@@ -163,6 +173,7 @@ class RtspVehicleWatcher:
                 enabled=False,
                 use_fast_alpr=False,
                 send_telegram=self.config.telegram_alerts_enabled,
+                extract_images=False,
                 record_seconds=max(1.0, VIDEO_RECORDING_SECONDS),
                 image_count=max(1, self.config.upload_top_frames),
                 coverage_trigger_percent=50.0,
@@ -190,21 +201,58 @@ class RtspVehicleWatcher:
         primary_zone = self._find_motion_zone("yellow")
         return [primary_zone] if primary_zone else []
 
+    def _sync_shared_recording_policy(self) -> None:
+        policy_zones = [zone for zone in self.motion_zones if zone.zone_id in {"yellow", "purple"}]
+        if not policy_zones:
+            return
+        shared_record_seconds = max(zone.record_seconds for zone in policy_zones)
+        shared_image_count = max(zone.image_count for zone in policy_zones)
+        shared_coverage_trigger_percent = max(zone.coverage_trigger_percent for zone in policy_zones)
+        shared_extract_images = any(zone.extract_images for zone in policy_zones)
+        shared_use_fast_alpr = any(zone.use_fast_alpr for zone in policy_zones)
+        shared_send_telegram = any(zone.send_telegram for zone in policy_zones)
+        camera_zone = self._find_motion_zone("camera")
+        if camera_zone:
+            policy_zones.append(camera_zone)
+        for zone in policy_zones:
+            zone.record_seconds = shared_record_seconds
+            zone.image_count = shared_image_count
+            zone.coverage_trigger_percent = shared_coverage_trigger_percent
+            zone.extract_images = shared_extract_images
+            zone.use_fast_alpr = shared_use_fast_alpr
+            zone.send_telegram = shared_send_telegram
+
     def _record_seconds_for_zone_ids(self, zone_ids: Set[str]) -> float:
+        self._sync_shared_recording_policy()
         return max((zone.record_seconds for zone in self._zones_for_policy(zone_ids)), default=max(1.0, VIDEO_RECORDING_SECONDS))
 
     def _image_limit_for_zone_ids(self, zone_ids: Set[str]) -> int:
+        self._sync_shared_recording_policy()
         return max((zone.image_count for zone in self._zones_for_policy(zone_ids)), default=max(1, self.config.upload_top_frames))
+
+    def _should_extend_recording_for_zone_ids(self, zone_ids: Set[str]) -> bool:
+        return True
+
+    def _event_extracts_images(self, event: Event) -> bool:
+        self._sync_shared_recording_policy()
+        for zone_id in event.zones_triggered:
+            zone = self._find_motion_zone(zone_id)
+            if zone and zone.extract_images:
+                return True
+        return False
 
     def _apply_camera_motion_config(self) -> None:
         if not self.config.use_camera_motion_api or not self.camera_motion_stream.configured():
+            self.camera_motion_config_applied = False
             return
         api_zones = [zone for zone in self.motion_zones if zone.zone_id != "camera"]
         with self.camera_motion_config_lock:
+            self.camera_motion_config_applied = False
             self.camera_motion_stream.apply_motion_settings(
                 api_zones,
                 self.config.hikvision_motion_sensitivity,
             )
+            self.camera_motion_config_applied = True
         logging.info(
             "Applied Hikvision motion API zones=%s sensitivity=%s",
             ",".join(zone.zone_id for zone in api_zones if zone.enabled) or "none",
@@ -238,6 +286,7 @@ class RtspVehicleWatcher:
                 self._apply_camera_motion_config()
                 logging.info("Refreshed Hikvision motion API registration")
             except Exception:
+                self.camera_motion_config_applied = False
                 logging.exception("Failed to refresh Hikvision motion API registration")
 
     def _load_runtime_config(self) -> None:
@@ -273,6 +322,7 @@ class RtspVehicleWatcher:
                         ) or zone.roi
                     zone.enabled = bool(zone_payload.get("enabled", zone.enabled))
                     zone.use_fast_alpr = bool(zone_payload.get("use_fast_alpr", zone.use_fast_alpr))
+                    zone.extract_images = bool(zone_payload.get("extract_images", zone.extract_images))
                     send_telegram_value = zone_payload.get("send_telegram", legacy_telegram_default)
                     if isinstance(send_telegram_value, str):
                         zone.send_telegram = parse_bool(send_telegram_value, default=zone.send_telegram)
@@ -299,6 +349,7 @@ class RtspVehicleWatcher:
             motion_sensitivity = payload.get("hikvision_motion_sensitivity")
             if motion_sensitivity is not None:
                 self.config.hikvision_motion_sensitivity = min(100, max(1, int(motion_sensitivity)))
+            self._sync_shared_recording_policy()
             self._sync_primary_zone_to_config()
             if should_resave:
                 self._save_runtime_config()
@@ -322,6 +373,7 @@ class RtspVehicleWatcher:
                             "enabled": zone.enabled,
                             "use_fast_alpr": zone.use_fast_alpr,
                             "send_telegram": zone.send_telegram,
+                            "extract_images": zone.extract_images,
                             "record_seconds": zone.record_seconds,
                             "image_count": zone.image_count,
                             "coverage_trigger_percent": zone.coverage_trigger_percent,
@@ -527,6 +579,7 @@ class RtspVehicleWatcher:
         try:
             self._apply_camera_motion_config()
         except Exception:
+            self.camera_motion_config_applied = False
             logging.exception("Failed to apply Hikvision motion API config; continuing with current camera config")
         self.camera_motion_stream.start()
         self._start_camera_motion_config_refresh()
@@ -564,6 +617,16 @@ class RtspVehicleWatcher:
         capture_error: queue.Queue[Exception] = queue.Queue(maxsize=1)
         capture_failure: List[Optional[Exception]] = [None]
         frame_queue: queue.Queue[Tuple[float, Any]] = queue.Queue(maxsize=1)
+        frame_read_timeout = 5.0
+        frame_queue_timeout = 2.0
+        if use_single_ffmpeg_capture:
+            frame_read_timeout = max(
+                10.0,
+                self.config.live_stream_warmup_seconds
+                + self.config.record_segment_seconds
+                + 6.0,
+            )
+            frame_queue_timeout = frame_read_timeout + 2.0
 
         def current_capture_error() -> Optional[Exception]:
             if capture_failure[0] is not None:
@@ -594,7 +657,21 @@ class RtspVehicleWatcher:
             try:
                 while not capture_stop.is_set():
                     if self.single_capture is not None:
-                        captured_frame = self.single_capture.read_frame(timeout_seconds=5.0)
+                        try:
+                            captured_frame = self.single_capture.read_frame(timeout_seconds=frame_read_timeout)
+                        except Exception as exc:
+                            with self.stats_lock:
+                                self.read_failure_total += 1
+                            logging.warning("RTSP ffmpeg reader stalled; restarting capture process: %s", exc)
+                            try:
+                                self.single_capture.stop()
+                                self.single_capture.start()
+                            except Exception as restart_exc:
+                                if capture_error.empty():
+                                    capture_error.put_nowait(restart_exc)
+                                return
+                            capture_stop.wait(1.0)
+                            continue
                     else:
                         ok, captured_frame = self.capture.read()
                         if not ok or captured_frame is None:
@@ -617,12 +694,20 @@ class RtspVehicleWatcher:
                 if reader_error is not None:
                     raise RuntimeError("RTSP reader failed") from reader_error
                 try:
-                    timestamp, original_frame = frame_queue.get(timeout=2.0)
+                    timestamp, original_frame = frame_queue.get(timeout=frame_queue_timeout)
                     frame_queue.task_done()
                 except queue.Empty:
                     reader_error = current_capture_error()
                     if reader_error is not None:
                         raise RuntimeError("RTSP reader failed") from reader_error
+                    if use_single_ffmpeg_capture:
+                        self._pad_video_recording_until(time.time())
+                        self.latest_motion_status = (
+                            "Waiting for RTSP frames; keeping current recording open"
+                            if self.video_recording is not None
+                            else "Waiting for RTSP frames"
+                        )
+                        continue
                     raise RuntimeError("Timed out waiting for frame from RTSP reader")
 
                 frame = self._resize_frame(original_frame)
@@ -634,16 +719,66 @@ class RtspVehicleWatcher:
                 overlay = self._draw_monitor_overlays(frame.copy())
 
                 if self.config.use_camera_motion_api and self.camera_motion_stream.configured():
-                    had_motion, triggered_zone_ids, api_status = self._camera_api_motion_state(timestamp)
-                    self.motion_streak = self.config.min_consecutive_hits if had_motion else 0
-                    self.last_triggered_zone_ids = set(triggered_zone_ids)
-                    self.last_zone_area_by_id = {zone_id: 1 for zone_id in triggered_zone_ids}
-                    self.last_zone_coverage_percent_by_id = {zone_id: 100.0 for zone_id in triggered_zone_ids}
-                    self.last_coverage_triggered_zone_ids = set(triggered_zone_ids)
-                    motion_area = 1 if had_motion else 0
-                    self.last_motion_area = motion_area
-                    self.last_motion_box = None
-                    self.latest_motion_status = api_status
+                    if self.camera_motion_config_applied:
+                        api_motion, _, api_status = self._camera_api_motion_state(timestamp)
+                        if api_motion:
+                            (
+                                motion_area,
+                                local_motion,
+                                best_box,
+                                overlay,
+                                local_zone_ids,
+                                zone_area_by_id,
+                                zone_coverage_percent_by_id,
+                                zone_motion_masks_by_id,
+                            ) = self._detect_motion(frame)
+                            if local_motion:
+                                had_motion = True
+                                triggered_zone_ids = self._camera_motion_zone_ids()
+                                self.motion_streak = self.config.min_consecutive_hits
+                                self.last_triggered_zone_ids = set(triggered_zone_ids)
+                            else:
+                                self.motion_streak = 0
+                                self.last_triggered_zone_ids = set()
+                            self.last_motion_area = motion_area
+                            self.last_motion_box = best_box
+                            self.last_zone_area_by_id = dict(zone_area_by_id)
+                            self.last_zone_coverage_percent_by_id = dict(zone_coverage_percent_by_id)
+                            self.last_coverage_triggered_zone_ids = set()
+                            overlay = self._annotate_motion_overlay(
+                                overlay,
+                                motion_area,
+                                best_box,
+                                had_motion,
+                                triggered_zone_ids,
+                                zone_area_by_id,
+                                zone_coverage_percent_by_id,
+                                set(),
+                            )
+                            if not had_motion:
+                                zones_text = ",".join(sorted(local_zone_ids)) if local_zone_ids else "none"
+                                self.latest_motion_status = (
+                                    f"{api_status}; local zone motion below threshold "
+                                    f"zones={zones_text} total={motion_area}"
+                                )
+                        else:
+                            self.motion_streak = 0
+                            self.last_triggered_zone_ids = set()
+                            self.last_zone_area_by_id = {}
+                            self.last_zone_coverage_percent_by_id = {}
+                            self.last_coverage_triggered_zone_ids = set()
+                            self.last_motion_area = 0
+                            self.last_motion_box = None
+                            self.latest_motion_status = api_status
+                    else:
+                        self.motion_streak = 0
+                        self.last_triggered_zone_ids = set()
+                        self.last_zone_area_by_id = {}
+                        self.last_zone_coverage_percent_by_id = {}
+                        self.last_coverage_triggered_zone_ids = set()
+                        self.last_motion_area = 0
+                        self.last_motion_box = None
+                        self.latest_motion_status = "Hikvision motion zones are not registered; recordings paused"
                     if not had_motion and not self.event:
                         self._discard_unconfirmed_video_recording()
                 else:
@@ -729,12 +864,13 @@ class RtspVehicleWatcher:
                     else:
                         self.video_recording.started_from_zone_ids.update(triggered_zone_ids)
                         # Guarantee minimum duration from confirmation time for the triggered zones
-                        min_ends_at = timestamp + self._record_seconds_for_zone_ids(triggered_zone_ids)
-                        self.video_recording.ends_at = max(self.video_recording.ends_at, min_ends_at)
-                        self.video_recording.record_seconds = max(
-                            self.video_recording.record_seconds,
-                            self.video_recording.ends_at - self.video_recording.started_at,
-                        )
+                        if self._should_extend_recording_for_zone_ids(triggered_zone_ids):
+                            min_ends_at = timestamp + self._record_seconds_for_zone_ids(triggered_zone_ids)
+                            self.video_recording.ends_at = max(self.video_recording.ends_at, min_ends_at)
+                            self.video_recording.record_seconds = max(
+                                self.video_recording.record_seconds,
+                                self.video_recording.ends_at - self.video_recording.started_at,
+                            )
                         if not self.video_recording.confirmed:
                             self.video_recording.confirmed = True
                             logging.info("Confirmed video recording for active motion event")
@@ -754,6 +890,7 @@ class RtspVehicleWatcher:
                 self.frame_index += 1
                 self._record_processing_frame()
         finally:
+            self._pad_video_recording_until(time.time())
             capture_stop.set()
             capture_thread.join(timeout=2.0)
             self._stop_video_recording()
@@ -897,7 +1034,7 @@ class RtspVehicleWatcher:
             except Exception:
                 logging.exception("Failed to remove stale temporary video %s", temp_path)
         segment_dir = self._recording_segment_dir()
-        for segment_path in segment_dir.glob("seg-*.mp4"):
+        for segment_path in segment_dir.glob("seg-*"):
             try:
                 segment_path.unlink(missing_ok=True)
             except Exception:
@@ -939,38 +1076,6 @@ class RtspVehicleWatcher:
         stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         output_path = video_dir / f"{self.config.camera_name}_{stamp}.mp4"
         temp_output_path = self._video_temp_dir() / output_path.name
-        if self.single_capture is not None:
-            first_frame_at = max(0.0, timestamp - self._video_prebuffer_seconds())
-            self.video_recording = VideoRecording(
-                started_at=timestamp,
-                first_frame_at=first_frame_at,
-                ends_at=timestamp + record_seconds,
-                record_seconds=record_seconds,
-                started_from_zone_ids=set(triggered_zone_ids),
-                output_path=output_path,
-                temp_output_path=temp_output_path,
-                writer=None,
-                last_written_at=timestamp,
-                frame_size=(0, 0),
-                fps=max(1.0, self.fps_guess),
-                source_url=self.config.rtsp_url,
-                confirmed=confirmed,
-            )
-            status = "confirmed motion" if confirmed else "motion warning"
-            logging.info(
-                "Started %.0f-second stream-copy video recording at %s on %s for zones=%s using rolling segments in %s",
-                record_seconds,
-                output_path,
-                status,
-                ",".join(sorted(triggered_zone_ids)) or "unknown",
-                self._recording_segment_dir(),
-            )
-            self._add_event_log(
-                "video",
-                f"Started stream-copy video {output_path.name} for {int(round(record_seconds))}s on {status} using rolling segments for zones={','.join(sorted(triggered_zone_ids)) or 'unknown'}",
-                zone_id=vid_zone_id,
-            )
-            return
         prebuffer_frames = [
             (frame_timestamp, frame_copy)
             for frame_timestamp, frame_copy in self.prebuffer
@@ -993,12 +1098,16 @@ class RtspVehicleWatcher:
             processing_fps = self._rolling_fps(deque(self.processing_frame_times))
         fps_source = self.config.video_fps if self.config.video_fps > 0 else (self.fps_guess or processing_fps or 20.0)
         fps = max(1.0, min(60.0, fps_source))
-        if shutil.which("ffmpeg"):
+        use_direct_rtsp_recording = self.single_capture is not None and shutil.which("ffmpeg")
+        if use_direct_rtsp_recording:
+            transport = self._rtsp_option_value("rtsp_transport", "tcp") or "tcp"
+            raw_writer = DirectRtspVideoWriter(temp_output_path, self.config.rtsp_url, record_seconds, transport)
+        elif shutil.which("ffmpeg"):
             raw_writer = FfmpegVideoWriter(temp_output_path, fps, frame_size, self.config.ffmpeg_threads)
         else:
             logging.warning("ffmpeg is unavailable; falling back to OpenCV mp4v writer")
             raw_writer = cv2.VideoWriter(str(temp_output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, frame_size)
-        writer = QueuedVideoWriter(raw_writer, temp_output_path, fps)
+        writer = raw_writer if use_direct_rtsp_recording else QueuedVideoWriter(raw_writer, temp_output_path, fps)
         if not writer.isOpened():
             try:
                 writer.release()
@@ -1014,7 +1123,8 @@ class RtspVehicleWatcher:
                 if last_written_at and frame_timestamp - last_written_at < min_frame_interval:
                     continue
                 prepared_frame = self._prepare_video_frame(buffered_frame, frame_size)
-                writer.write(prepared_frame)
+                if not use_direct_rtsp_recording:
+                    writer.write(prepared_frame)
                 if not last_written_at:
                     first_frame_at = frame_timestamp
                 last_written_at = frame_timestamp
@@ -1039,7 +1149,7 @@ class RtspVehicleWatcher:
             confirmed=confirmed,
         )
         status = "confirmed motion" if confirmed else "motion warning"
-        recording_mode = "main capture original frames"
+        recording_mode = "direct RTSP stream-copy" if use_direct_rtsp_recording else "main capture original frames"
         logging.info(
             "Started %.0f-second video recording at %s on %s for zones=%s using %s",
             record_seconds,
@@ -1059,7 +1169,7 @@ class RtspVehicleWatcher:
         if recording is None:
             return
         if timestamp > recording.ends_at:
-            self._stop_video_recording()
+            self._pad_video_recording_until(timestamp)
             return
         if recording.writer is None:
             recording.last_written_at = timestamp
@@ -1078,6 +1188,32 @@ class RtspVehicleWatcher:
             recording.last_written_at = timestamp
         recording.last_frame = prepared_frame
 
+    def _pad_video_recording_until(self, timestamp: float) -> None:
+        recording = self.video_recording
+        if recording is None:
+            return
+        if recording.writer is None:
+            if timestamp >= recording.ends_at:
+                self._stop_video_recording()
+            return
+        if recording.last_frame is None:
+            return
+        target_timestamp = min(timestamp, recording.ends_at)
+        min_frame_interval = 1.0 / recording.fps
+        if target_timestamp <= recording.last_written_at:
+            if timestamp >= recording.ends_at:
+                self._stop_video_recording()
+            return
+        elapsed = target_timestamp - recording.last_written_at
+        frames_to_write = max(1, int(round(elapsed / min_frame_interval)))
+        for _ in range(frames_to_write):
+            recording.writer.write(recording.last_frame)
+        recording.last_written_at += frames_to_write * min_frame_interval
+        if recording.last_written_at > target_timestamp:
+            recording.last_written_at = target_timestamp
+        if timestamp >= recording.ends_at and recording.last_written_at >= recording.ends_at - min_frame_interval:
+            self._stop_video_recording()
+
     def _stop_video_recording(self) -> None:
         recording = self.video_recording
         if recording is None:
@@ -1093,15 +1229,6 @@ class RtspVehicleWatcher:
             self.last_video_recording = recording
             self.last_recording_ended_at = time.time()
         rec_zone_id = self._primary_zone_id_for(recording.started_from_zone_ids)
-        if recording.writer is None and recording.confirmed and self.single_capture is not None:
-            try:
-                recording.segment_paths = self.single_capture.copy_clip(
-                    recording.first_frame_at,
-                    recording.ends_at,
-                    recording.temp_output_path,
-                )
-            except Exception as exc:
-                release_error = exc
         if release_error:
             if not self._video_file_is_readable(recording.temp_output_path):
                 recording.temp_output_path.unlink(missing_ok=True)
@@ -1445,20 +1572,25 @@ class RtspVehicleWatcher:
 
     def _write_video_metadata(self, recording: VideoRecording) -> None:
         metadata_path = recording.output_path.with_suffix(".json")
+        actual_duration_seconds = self._video_duration_seconds_with_ffprobe(recording.output_path)
         metadata_path.write_text(
             json.dumps(
                 {
                     "camera_name": self.config.camera_name,
                     "video_path": str(recording.output_path),
                     "source": "capture-stream",
-                    "recording_mode": "stream_copy_segments" if recording.writer is None else "main_capture_original_frames",
+                    "recording_mode": "direct_rtsp_stream_copy"
+                    if isinstance(recording.writer, DirectRtspVideoWriter)
+                    else ("stream_copy_segments" if recording.writer is None else "main_capture_original_frames"),
                     "started_at_epoch": recording.started_at,
                     "first_frame_at_epoch": recording.first_frame_at,
                     "ends_at_epoch": recording.ends_at,
                     "zone_ids": sorted(recording.started_from_zone_ids),
                     "event_count": len(recording.pending_events),
                     "prebuffer_seconds": self._video_prebuffer_seconds(),
-                    "recording_seconds": recording.record_seconds,
+                    "recording_seconds": actual_duration_seconds if actual_duration_seconds > 0 else recording.record_seconds,
+                    "planned_recording_seconds": recording.record_seconds,
+                    "actual_duration_seconds": actual_duration_seconds,
                     "segment_count": len(recording.segment_paths),
                     "segment_paths": [str(path) for path in recording.segment_paths],
                 },
@@ -1715,8 +1847,9 @@ class RtspVehicleWatcher:
         recording = self.video_recording
         if recording is not None:
             recording.started_from_zone_ids.update(triggered_zone_ids)
-            recording.ends_at = max(recording.ends_at, timestamp + self._record_seconds_for_zone_ids(self.event.zones_triggered))
-            recording.record_seconds = max(recording.record_seconds, recording.ends_at - recording.started_at)
+            if self._should_extend_recording_for_zone_ids(self.event.zones_triggered):
+                recording.ends_at = max(recording.ends_at, timestamp + self._record_seconds_for_zone_ids(self.event.zones_triggered))
+                recording.record_seconds = max(recording.record_seconds, recording.ends_at - recording.started_at)
         self.event.append_candidate(candidate)
         self._append_event_frame(timestamp, frame, count_as_postbuffer=False)
 
@@ -1917,10 +2050,10 @@ class RtspVehicleWatcher:
         logging.info("Closing event: %s", reason)
         zone_id = self._primary_zone_id_for(event.zones_triggered)
         self._add_event_log("motion", f"Closed motion event: {reason}", zone_id=zone_id)
-        if not self._event_uses_fast_alpr(event):
+        if not self._event_extracts_images(event):
             self._add_event_log(
                 "image",
-                "Skipped automatic image creation because Send to ALPR is disabled for the triggered zone",
+                "Skipped automatic image extraction because Extract images is disabled",
                 zone_id=zone_id,
             )
             return
@@ -2504,6 +2637,7 @@ class RtspVehicleWatcher:
                     "label": zone.label,
                     "use_fast_alpr": zone.use_fast_alpr,
                     "send_telegram": zone.send_telegram,
+                    "extract_images": zone.extract_images,
                     "record_seconds": zone.record_seconds,
                     "image_count": zone.image_count,
                     "coverage_trigger_percent": zone.coverage_trigger_percent,
@@ -2703,6 +2837,12 @@ class RtspVehicleWatcher:
                     return
                 if path == "/api/motion-settings":
                     watcher._handle_motion_settings_update(self)
+                    return
+                if path == "/api/test-motion-event":
+                    watcher._handle_test_motion_event(self)
+                    return
+                if path == "/api/logs/clear":
+                    watcher._handle_clear_logs(self)
                     return
                 if path == "/api/images/clear":
                     watcher._handle_clear_images(self)
@@ -2966,6 +3106,7 @@ class RtspVehicleWatcher:
         return [float(value) for value in roi]
 
     def _zones_for_ui(self) -> List[dict[str, Any]]:
+        self._sync_shared_recording_policy()
         return [
             {
                 "id": zone.zone_id,
@@ -2974,6 +3115,7 @@ class RtspVehicleWatcher:
                 "enabled": zone.enabled,
                 "use_fast_alpr": zone.use_fast_alpr,
                 "send_telegram": zone.send_telegram,
+                "extract_images": zone.extract_images,
                 "record_seconds": float(zone.record_seconds),
                 "image_count": int(zone.image_count),
                 "coverage_trigger_percent": float(zone.coverage_trigger_percent),
@@ -3022,6 +3164,21 @@ class RtspVehicleWatcher:
     </div>
   </div>
   <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px; margin-top:14px;">
+    <label style="display:block; color:#cbd5e1;">Video minimum time
+      <select id="shared-record-seconds" style="display:block; width:100%; margin-top:6px; background:#07110f; color:#edf7f2; border:1px solid #334155; border-radius:8px; padding:8px;"></select>
+    </label>
+    <label style="display:block; color:#cbd5e1;">Images to create
+      <select id="shared-image-count" style="display:block; width:100%; margin-top:6px; background:#07110f; color:#edf7f2; border:1px solid #334155; border-radius:8px; padding:8px;"></select>
+    </label>
+    <label style="display:block; color:#cbd5e1;">Coverage trigger
+      <select id="shared-coverage-trigger" style="display:block; width:100%; margin-top:6px; background:#07110f; color:#edf7f2; border:1px solid #334155; border-radius:8px; padding:8px;"></select>
+    </label>
+    <div style="display:flex; align-items:center; gap:12px; color:#cbd5e1;">
+      <button id="shared-extract-images" type="button" class="toggle-button" data-state="on" aria-label="Toggle video image extraction" title="Extract images from video" style="display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:999px;border:1px solid #4ade80;background:transparent;color:#4ade80;cursor:pointer;padding:0;"><svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor;"><path d="M17 7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h10c2.76 0 5-2.24 5-5s-2.24-5-5-5zm0 8c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3z"/></svg></button>
+      <span>Extract images</span>
+    </div>
+  </div>
+  <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px; margin-top:14px;">
     <div style="background:#0f172a; border:1px solid #334155; border-radius:8px; padding:12px;">
       <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
         <button id="zone-select-yellow" type="button" style="background:#facc15; color:#111827; border:0; border-radius:8px; padding:8px 12px; cursor:pointer; font-weight:700;">Edit Yellow Zone</button>
@@ -3033,15 +3190,6 @@ class RtspVehicleWatcher:
         <button id="zone-telegram-yellow" type="button" class="toggle-button" data-state="on" aria-label="Toggle Telegram" title="Telegram" style="display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:999px;border:1px solid #4ade80;background:transparent;color:#4ade80;cursor:pointer;padding:0;"><svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor;"><path d="M17 7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h10c2.76 0 5-2.24 5-5s-2.24-5-5-5zm0 8c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3z"/></svg></button>
         <span style="color:#cbd5e1;">Telegram</span>
       </div>
-      <label style="display:block; margin-top:10px; color:#cbd5e1;">Record time
-        <select id="zone-record-seconds-yellow" style="display:block; width:100%; margin-top:6px; background:#07110f; color:#edf7f2; border:1px solid #334155; border-radius:8px; padding:8px;"></select>
-      </label>
-      <label style="display:block; margin-top:10px; color:#cbd5e1;">Saved images
-        <select id="zone-image-count-yellow" style="display:block; width:100%; margin-top:6px; background:#07110f; color:#edf7f2; border:1px solid #334155; border-radius:8px; padding:8px;"></select>
-      </label>
-      <label style="display:block; margin-top:10px; color:#cbd5e1;">Coverage trigger
-        <select id="zone-coverage-trigger-yellow" style="display:block; width:100%; margin-top:6px; background:#07110f; color:#edf7f2; border:1px solid #334155; border-radius:8px; padding:8px;"></select>
-      </label>
     </div>
     <div style="background:#0f172a; border:1px solid #334155; border-radius:8px; padding:12px;">
       <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
@@ -3054,15 +3202,6 @@ class RtspVehicleWatcher:
         <button id="zone-telegram-purple" type="button" class="toggle-button" data-state="off" aria-label="Toggle Telegram" title="Telegram" style="display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:999px;border:1px solid #334155;background:transparent;color:#64748b;cursor:pointer;padding:0;"><svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor;"><path d="M17 7H7C4.24 7 2 9.24 2 12s2.24 5 5 5h10c2.76 0 5-2.24 5-5s-2.24-5-5-5zM7 15c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3z"/></svg></button>
         <span style="color:#cbd5e1;">Telegram</span>
       </div>
-      <label style="display:block; margin-top:10px; color:#cbd5e1;">Record time
-        <select id="zone-record-seconds-purple" style="display:block; width:100%; margin-top:6px; background:#07110f; color:#edf7f2; border:1px solid #334155; border-radius:8px; padding:8px;"></select>
-      </label>
-      <label style="display:block; margin-top:10px; color:#cbd5e1;">Saved images
-        <select id="zone-image-count-purple" style="display:block; width:100%; margin-top:6px; background:#07110f; color:#edf7f2; border:1px solid #334155; border-radius:8px; padding:8px;"></select>
-      </label>
-      <label style="display:block; margin-top:10px; color:#cbd5e1;">Coverage trigger
-        <select id="zone-coverage-trigger-purple" style="display:block; width:100%; margin-top:6px; background:#07110f; color:#edf7f2; border:1px solid #334155; border-radius:8px; padding:8px;"></select>
-      </label>
     </div>
   </div>
   <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:14px;">
@@ -3121,19 +3260,11 @@ class RtspVehicleWatcher:
     yellow: document.getElementById('zone-telegram-yellow'),
     purple: document.getElementById('zone-telegram-purple'),
   }};
-  const zoneRecordSeconds = {{
-    yellow: document.getElementById('zone-record-seconds-yellow'),
-    purple: document.getElementById('zone-record-seconds-purple'),
-  }};
-  const zoneImageCount = {{
-    yellow: document.getElementById('zone-image-count-yellow'),
-    purple: document.getElementById('zone-image-count-purple'),
-  }};
-  const zoneCoverageTrigger = {{
-    yellow: document.getElementById('zone-coverage-trigger-yellow'),
-    purple: document.getElementById('zone-coverage-trigger-purple'),
-  }};
-  if (!editor || !overlay || !img || !saveBtn || !resetBtn || !status || !sensitivity || !sensitivityValue || !sensitivitySave || handles.length !== 4 || !zoneBoxes.yellow || !zoneBoxes.purple || !zoneButtons.yellow || !zoneButtons.purple || !zoneEnabled.yellow || !zoneEnabled.purple || !zoneFastAlpr.yellow || !zoneFastAlpr.purple || !zoneTelegram.yellow || !zoneTelegram.purple || !zoneRecordSeconds.yellow || !zoneRecordSeconds.purple || !zoneImageCount.yellow || !zoneImageCount.purple || !zoneCoverageTrigger.yellow || !zoneCoverageTrigger.purple) return;
+  const sharedRecordSeconds = document.getElementById('shared-record-seconds');
+  const sharedImageCount = document.getElementById('shared-image-count');
+  const sharedCoverageTrigger = document.getElementById('shared-coverage-trigger');
+  const sharedExtractImages = document.getElementById('shared-extract-images');
+  if (!editor || !overlay || !img || !saveBtn || !resetBtn || !status || !sensitivity || !sensitivityValue || !sensitivitySave || handles.length !== 4 || !zoneBoxes.yellow || !zoneBoxes.purple || !zoneButtons.yellow || !zoneButtons.purple || !zoneEnabled.yellow || !zoneEnabled.purple || !zoneFastAlpr.yellow || !zoneFastAlpr.purple || !zoneTelegram.yellow || !zoneTelegram.purple || !sharedRecordSeconds || !sharedImageCount || !sharedCoverageTrigger || !sharedExtractImages) return;
 
   let zones = initialZones.map((zone) => ({{ ...zone, roi: zone.roi.slice() }}));
   let activeZoneId = null;
@@ -3205,12 +3336,9 @@ class RtspVehicleWatcher:
       .join('');
   }}
 
-  populateSelectOptions(zoneRecordSeconds.yellow, recordTimeOptions, (value) => `${{value}} seconds`);
-  populateSelectOptions(zoneRecordSeconds.purple, recordTimeOptions, (value) => `${{value}} seconds`);
-  populateSelectOptions(zoneImageCount.yellow, imageCountOptions, (value) => `${{value}} images`);
-  populateSelectOptions(zoneImageCount.purple, imageCountOptions, (value) => `${{value}} images`);
-  populateSelectOptions(zoneCoverageTrigger.yellow, coverageTriggerOptions, (value) => `${{value}}%`);
-  populateSelectOptions(zoneCoverageTrigger.purple, coverageTriggerOptions, (value) => `${{value}}%`);
+  populateSelectOptions(sharedRecordSeconds, recordTimeOptions, (value) => `${{value}} seconds`);
+  populateSelectOptions(sharedImageCount, imageCountOptions, (value) => `${{value}} images`);
+  populateSelectOptions(sharedCoverageTrigger, coverageTriggerOptions, (value) => `${{value}}%`);
 
   function clamp(value, min, max) {{
     return Math.min(max, Math.max(min, value));
@@ -3242,6 +3370,34 @@ class RtspVehicleWatcher:
     return zones.find((zone) => zone.id === zoneId);
   }}
 
+  function sharedRecordSecondsValue() {{
+    const values = zones.map((zone) => Number(zone.record_seconds)).filter((value) => Number.isFinite(value) && value > 0);
+    return values.length ? Math.max(...values) : 180;
+  }}
+
+  function sharedImageCountValue() {{
+    const values = zones.map((zone) => Number(zone.image_count)).filter((value) => Number.isFinite(value) && value > 0);
+    return values.length ? Math.max(...values) : 1;
+  }}
+
+  function sharedCoverageTriggerValue() {{
+    const values = zones.map((zone) => Number(zone.coverage_trigger_percent)).filter((value) => Number.isFinite(value) && value >= 0);
+    return values.length ? Math.max(...values) : 0;
+  }}
+
+  function sharedExtractImagesValue() {{
+    return zones.some((zone) => zone.extract_images !== false);
+  }}
+
+  function setSharedRecordingPolicy(recordSeconds, imageCount, coverageTriggerPercent, extractImages = sharedExtractImagesValue()) {{
+    zones.forEach((zone) => {{
+      zone.record_seconds = recordSeconds;
+      zone.image_count = imageCount;
+      zone.coverage_trigger_percent = coverageTriggerPercent;
+      zone.extract_images = Boolean(extractImages);
+    }});
+  }}
+
   function getNormalizedPointer(clientX, clientY) {{
     const rect = overlay.getBoundingClientRect();
     if (!rect.width || !rect.height) return null;
@@ -3265,19 +3421,28 @@ class RtspVehicleWatcher:
   }}
 
   function syncZoneControls() {{
+    const sharedRecordSecondsRounded = Math.round(sharedRecordSecondsValue());
+    const sharedImageCountRounded = Math.round(sharedImageCountValue());
+    const sharedCoverageTriggerRounded = Math.round(sharedCoverageTriggerValue());
+    sharedRecordSeconds.value = String(sharedRecordSecondsRounded);
+    sharedImageCount.value = String(sharedImageCountRounded);
+    sharedCoverageTrigger.value = String(sharedCoverageTriggerRounded);
+    const extractImages = sharedExtractImagesValue();
+    setSharedRecordingPolicy(sharedRecordSecondsRounded, sharedImageCountRounded, sharedCoverageTriggerRounded, extractImages);
+    setToggle(sharedExtractImages, extractImages);
     zones.forEach((zone) => {{
       zoneEnabled[zone.id].checked = Boolean(zone.enabled);
       setToggle(zoneFastAlpr[zone.id], Boolean(zone.use_fast_alpr));
       setToggle(zoneTelegram[zone.id], Boolean(zone.send_telegram));
-      zoneRecordSeconds[zone.id].value = String(Math.round(zone.record_seconds || 180));
-      zoneImageCount[zone.id].value = String(Math.round(zone.image_count || 1));
-      zoneCoverageTrigger[zone.id].value = String(Math.round(zone.coverage_trigger_percent || 0));
       zoneButtons[zone.id].style.outline = zone.id === activeZoneId ? `2px solid ${{zone.color}}` : 'none';
       zoneButtons[zone.id].textContent = zone.id === activeZoneId ? `Editing ${{zone.label}}` : `Edit ${{zone.label}}`;
     }});
   }}
 
   function draw() {{
+    const sharedRecordSecondsRounded = Math.round(sharedRecordSecondsValue());
+    const sharedImageCountRounded = Math.round(sharedImageCountValue());
+    const sharedCoverageTriggerRounded = Math.round(sharedCoverageTriggerValue());
     zones.forEach((zone) => {{
       const [x1, y1, x2, y2] = zone.roi;
       const box = zoneBoxes[zone.id];
@@ -3305,8 +3470,9 @@ class RtspVehicleWatcher:
         handle.style.pointerEvents = 'none';
       }});
       syncZoneControls();
-      const zoneSummaries = zones.map((zone) => `${{zone.label}}: ${{zone.enabled ? 'on' : 'off'}}, ${{zone.use_fast_alpr ? 'fast-alpr' : 'images only'}}, ${{zone.send_telegram ? 'telegram' : 'no telegram'}}, ${{Math.round(zone.record_seconds)}}s, ${{Math.round(zone.image_count)}} images, coverage ${{Math.round(zone.coverage_trigger_percent)}}%`);
-      setStatus(`Motion zones saved | ${{zoneSummaries.join(' | ')}}`);
+      const extractText = sharedExtractImagesValue() ? `${{sharedImageCountRounded}} images` : 'no images';
+      const zoneSummaries = zones.map((zone) => `${{zone.label}}: ${{zone.enabled ? 'on' : 'off'}}, ${{zone.extract_images ? (zone.use_fast_alpr ? 'fast-alpr' : 'images only') : 'no images'}}, ${{zone.send_telegram ? 'telegram' : 'no telegram'}}`);
+      setStatus(`Motion zones saved | video ${{sharedRecordSecondsRounded}}s, ${{extractText}}, coverage ${{sharedCoverageTriggerRounded}}% | ${{zoneSummaries.join(' | ')}}`);
       return;
     }}
     const [x1, y1, x2, y2] = activeZone.roi;
@@ -3331,8 +3497,9 @@ class RtspVehicleWatcher:
       handle.style.padding = '0';
     }});
     syncZoneControls();
-    const zoneSummaries = zones.map((zone) => `${{zone.label}}: ${{zone.enabled ? 'on' : 'off'}}, ${{zone.use_fast_alpr ? 'fast-alpr' : 'images only'}}, ${{zone.send_telegram ? 'telegram' : 'no telegram'}}, ${{Math.round(zone.record_seconds)}}s, ${{Math.round(zone.image_count)}} images, coverage ${{Math.round(zone.coverage_trigger_percent)}}%`);
-    setStatus(`Editing ${{activeZone.label}} | ROI: ${{activeZone.roi.map((v) => v.toFixed(3)).join(', ')}} | ${{zoneSummaries.join(' | ')}}`);
+    const extractText = sharedExtractImagesValue() ? `${{sharedImageCountRounded}} images` : 'no images';
+    const zoneSummaries = zones.map((zone) => `${{zone.label}}: ${{zone.enabled ? 'on' : 'off'}}, ${{zone.extract_images ? (zone.use_fast_alpr ? 'fast-alpr' : 'images only') : 'no images'}}, ${{zone.send_telegram ? 'telegram' : 'no telegram'}}`);
+    setStatus(`Editing ${{activeZone.label}} | ROI: ${{activeZone.roi.map((v) => v.toFixed(3)).join(', ')}} | video ${{sharedRecordSecondsRounded}}s, ${{extractText}}, coverage ${{sharedCoverageTriggerRounded}}% | ${{zoneSummaries.join(' | ')}}`);
   }}
 
   function updateFromPointer(clientX, clientY) {{
@@ -3461,31 +3628,24 @@ class RtspVehicleWatcher:
     }});
   }});
 
-  Object.entries(zoneRecordSeconds).forEach(([zoneId, select]) => {{
-    select.addEventListener('change', () => {{
-      const zone = findZone(zoneId);
-      if (!zone) return;
-      zone.record_seconds = Number(select.value) || zone.record_seconds;
-      draw();
-    }});
+  sharedRecordSeconds.addEventListener('change', () => {{
+    setSharedRecordingPolicy(Number(sharedRecordSeconds.value) || sharedRecordSecondsValue(), sharedImageCountValue(), sharedCoverageTriggerValue(), sharedExtractImagesValue());
+    draw();
   }});
 
-  Object.entries(zoneImageCount).forEach(([zoneId, select]) => {{
-    select.addEventListener('change', () => {{
-      const zone = findZone(zoneId);
-      if (!zone) return;
-      zone.image_count = Number(select.value) || zone.image_count;
-      draw();
-    }});
+  sharedImageCount.addEventListener('change', () => {{
+    setSharedRecordingPolicy(sharedRecordSecondsValue(), Number(sharedImageCount.value) || sharedImageCountValue(), sharedCoverageTriggerValue(), sharedExtractImagesValue());
+    draw();
   }});
 
-  Object.entries(zoneCoverageTrigger).forEach(([zoneId, select]) => {{
-    select.addEventListener('change', () => {{
-      const zone = findZone(zoneId);
-      if (!zone) return;
-      zone.coverage_trigger_percent = Number(select.value) || 0;
-      draw();
-    }});
+  sharedCoverageTrigger.addEventListener('change', () => {{
+    setSharedRecordingPolicy(sharedRecordSecondsValue(), sharedImageCountValue(), Number(sharedCoverageTrigger.value) || 0, sharedExtractImagesValue());
+    draw();
+  }});
+
+  sharedExtractImages.addEventListener('click', () => {{
+    setSharedRecordingPolicy(sharedRecordSecondsValue(), sharedImageCountValue(), sharedCoverageTriggerValue(), !sharedExtractImagesValue());
+    draw();
   }});
 
   sensitivity.addEventListener('input', () => {{
@@ -3552,13 +3712,13 @@ img, video, canvas, svg { max-width: 100%; }
 button, input, select, textarea { font: inherit; max-width: 100%; }
 button, a, input, select, textarea { touch-action: manipulation; }
 .page-shell { width: min(1380px, calc(100% - 32px)); margin: 0 auto; padding: 22px 0 34px; }
-.topbar { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 24px; padding: 12px 14px; background: rgba(9, 18, 17, 0.92); border: 1px solid #24413c; border-radius: 8px; box-shadow: 0 14px 40px rgba(0, 0, 0, 0.28); }
+.topbar { display: grid; grid-template-columns: 150px minmax(590px, 1fr) 260px 86px; align-items: center; gap: 12px; margin-bottom: 24px; padding: 12px 14px; background: rgba(9, 18, 17, 0.92); border: 1px solid #24413c; border-radius: 8px; box-shadow: 0 14px 40px rgba(0, 0, 0, 0.28); }
 .brand { color: #f8fafc; font-weight: 800; text-decoration: none; letter-spacing: 0; white-space: nowrap; }
-.nav-links { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
-.nav-links a { color: #cde8de; text-decoration: none; border: 1px solid #2f514b; border-radius: 8px; padding: 8px 11px; background: #10211f; line-height: 1; }
+.nav-links { display: grid; grid-template-columns: repeat(6, 92px); gap: 8px; justify-content: center; }
+.nav-links a { display: inline-flex; align-items: center; justify-content: center; width: 92px; min-height: 34px; color: #cde8de; text-decoration: none; border: 1px solid #2f514b; border-radius: 8px; padding: 8px 10px; background: #10211f; line-height: 1; font-weight: 700; text-align: center; }
 .nav-links a:hover { border-color: #5eead4; color: #f8fafc; background: #17302d; }
-.nav-links a.active { border-color: #facc15; color: #111827; background: #facc15; font-weight: 700; }
-.topbar-status { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.nav-links a.active { border-color: #facc15; color: #111827; background: #facc15; }
+.topbar-status { display: flex; align-items: center; gap: 8px; flex-wrap: nowrap; justify-content: flex-end; min-width: 0; }
 .system-clock, .extraction-indicator { color: #d9f99d; border: 1px solid #2f514b; border-radius: 8px; background: #07110f; padding: 8px 11px; white-space: nowrap; font-variant-numeric: tabular-nums; line-height: 1; }
 .extraction-indicator { display: none; align-items: center; gap: 7px; }
 .extraction-indicator.is-visible { display: inline-flex; }
@@ -3566,7 +3726,7 @@ button, a, input, select, textarea { touch-action: manipulation; }
 .extraction-stop { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 8px; border: 1px solid #2f514b; background: #10211f; color: #d9f99d; cursor: pointer; padding: 0; flex-shrink: 0; }
 .extraction-stop:hover { border-color: #fca5a5; color: #fee2e2; background: #450a0a; }
 .extraction-stop svg { width: 11px; height: 11px; }
-.menu-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+.menu-actions { display: flex; flex-wrap: nowrap; gap: 8px; justify-content: flex-end; min-width: 86px; min-height: 36px; }
 .menu-actions form { margin: 0; }
 .menu-actions button { color: #fee2e2; text-decoration: none; border: 1px solid #7f1d1d; border-radius: 8px; padding: 8px 11px; background: #450a0a; line-height: 1; cursor: pointer; font: inherit; }
 .menu-actions button:hover { border-color: #fca5a5; color: #fff; background: #7f1d1d; }
@@ -3586,10 +3746,10 @@ h1 { margin-top: 0; }
   h2 { font-size: clamp(1.15rem, 6vw, 1.45rem); line-height: 1.18; }
   p, li { line-height: 1.45; }
   .page-shell { width: min(100% - 20px, 1380px); padding-top: 10px; padding-bottom: 24px; }
-  .topbar { align-items: stretch; flex-direction: column; gap: 12px; margin-bottom: 18px; padding: 10px; }
+  .topbar { display: grid; grid-template-columns: 1fr; align-items: stretch; gap: 12px; margin-bottom: 18px; padding: 10px; }
   .brand { white-space: normal; line-height: 1.2; }
-  .nav-links { justify-content: flex-start; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-  .nav-links a { display: flex; align-items: center; justify-content: center; min-height: 42px; padding: 9px 10px; text-align: center; }
+  .nav-links { justify-content: stretch; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .nav-links a { display: flex; align-items: center; justify-content: center; width: 100%; min-height: 42px; padding: 9px 10px; text-align: center; }
   .topbar-status { justify-content: flex-start; align-items: stretch; }
   .system-clock, .extraction-indicator { padding: 9px 10px; }
   .menu-actions { justify-content: flex-start; align-items: stretch; }
@@ -3623,6 +3783,12 @@ h1 { margin-top: 0; }
             for item_id, href, label in items
         )
         action_by_page = {
+            "dashboard": (
+                '<form method="post" action="/api/logs/clear" data-double-confirm="Clear Logs" style="margin:0;">'
+                '<button class="menu-icon-button danger" type="submit" aria-label="Clear logs" title="Clear logs">'
+                '<svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor;"><path d="M6 3h12v2H6V3Zm1 4h10l-.7 13H7.7L7 7Zm3 2 .3 9h1.7l-.3-9H10Zm4 0-.3 9h1.7l.3-9H14ZM4 7h16v2H4V7Z"/></svg>'
+                '</button></form>'
+            ),
             "images": (
                 '<form method="post" action="/api/images/clear" data-double-confirm="Remove Images" style="margin:0;">'
                 '<button class="menu-icon-button danger" type="submit" aria-label="Remove all images" title="Remove all images">'
@@ -3642,7 +3808,7 @@ h1 { margin-top: 0; }
             "plates": '<form method="post" action="/api/plates/clear" data-double-confirm="Remove Plates"><button type="submit">Remove Plates</button></form>',
         }
         action = action_by_page.get(active, "")
-        actions = f'<div class="menu-actions" aria-label="Page actions">{action}</div>' if action else ""
+        actions = f'<div class="menu-actions" aria-label="Page actions">{action}</div>'
         return f"""<header class="topbar">
   <a class="brand" href="/">ALPR Watcher</a>
   <nav class="nav-links" aria-label="Main navigation">{links}</nav>
@@ -3900,74 +4066,6 @@ h1 { margin-top: 0; }
 }})();
 </script>"""
 
-    def _render_live_view_script(self) -> str:
-        return """<script>
-(() => {
-  const stream = document.getElementById('live-clean-stream');
-  const readout = document.getElementById('live-zoom-readout');
-  const zoomIn = document.getElementById('live-zoom-in');
-  const zoomOut = document.getElementById('live-zoom-out');
-  const panLeft = document.getElementById('live-pan-left');
-  const panRight = document.getElementById('live-pan-right');
-  const panUp = document.getElementById('live-pan-up');
-  const panDown = document.getElementById('live-pan-down');
-  const reset = document.getElementById('live-reset');
-  if (!stream || !readout || !zoomIn || !zoomOut || !panLeft || !panRight || !panUp || !panDown || !reset) return;
-
-  let zoom = 1;
-  let offsetX = 0;
-  let offsetY = 0;
-
-  function clamp(value, min, max) {
-    return Math.min(max, Math.max(min, value));
-  }
-
-  function applyView() {
-    if (zoom <= 1) {
-      offsetX = 0;
-      offsetY = 0;
-    }
-    const maxOffset = Math.max(0, ((zoom - 1) / zoom) * 50);
-    offsetX = clamp(offsetX, -maxOffset, maxOffset);
-    offsetY = clamp(offsetY, -maxOffset, maxOffset);
-    stream.style.transform = `scale(${zoom}) translate(${offsetX}%, ${offsetY}%)`;
-    readout.textContent = `Zoom ${Math.round(zoom * 100)}%`;
-  }
-
-  zoomIn.addEventListener('click', () => {
-    zoom = clamp(Number((zoom + 0.25).toFixed(2)), 1, 4);
-    applyView();
-  });
-  zoomOut.addEventListener('click', () => {
-    zoom = clamp(Number((zoom - 0.25).toFixed(2)), 1, 4);
-    applyView();
-  });
-  panLeft.addEventListener('click', () => {
-    offsetX += 6;
-    applyView();
-  });
-  panRight.addEventListener('click', () => {
-    offsetX -= 6;
-    applyView();
-  });
-  panUp.addEventListener('click', () => {
-    offsetY += 6;
-    applyView();
-  });
-  panDown.addEventListener('click', () => {
-    offsetY -= 6;
-    applyView();
-  });
-  reset.addEventListener('click', () => {
-    zoom = 1;
-    offsetX = 0;
-    offsetY = 0;
-    applyView();
-  });
-  applyView();
-})();
-</script>"""
-
     def _render_home_page(self) -> str:
         recent = self._render_recent_plate_cards(limit=8, include_images=False)
         gallery = self._render_image_cards(self._list_saved_images()[:8])
@@ -4071,87 +4169,6 @@ a {{ color: #93c5fd; }}
 
   setInterval(refreshEventLog, 2000);
   refreshEventLog();
-}})();
-</script>
-</body></html>"""
-
-    def _render_live_page(self) -> str:
-        live_preview_url = json.dumps("/stream-clean.mjpg")
-        return f"""<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Live Video</title>
-<style>
-{self._render_shared_styles()}
-html, body {{ margin: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }}
-body {{ padding: 0; }}
-.page-shell {{ width: 100%; height: 100dvh; margin: 0; padding: 12px; display: flex; flex-direction: column; gap: 12px; }}
-.topbar {{ flex-shrink: 0; z-index: 5; margin: 0; }}
-.live-frame {{ position: relative; flex: 1; min-height: 0; background: #000; overflow: hidden; }}
-.live-frame img {{ position: absolute; left: 50%; top: 50%; width: 100%; height: 100%; object-fit: contain; display: block; background: #000; transform: translate(-50%, -50%); transform-origin: center; }}
-.live-frame.vertical img {{ width: 100dvh; height: 100vw; transform: translate(-50%, -50%) rotate(90deg); }}
-.live-error {{ position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); z-index: 6; padding: 10px 14px; border-radius: 999px; background: rgba(15, 23, 42, 0.88); color: #f8fafc; border: 1px solid rgba(148, 163, 184, 0.4); }}
-@media (max-width: 760px) {{
-  .page-shell {{ padding: 8px; gap: 8px; }}
-  .topbar {{ max-height: 44dvh; overflow: auto; }}
-}}
-</style></head>
-<body>
-<div class="page-shell">
-{self._render_nav("live")}
-<main class="live-frame">
-  <img id="live-clean-stream" alt="Live camera stream">
-</main>
-<div id="live-error" class="live-error" style="display:none;">Waiting for live stream...</div>
-</div>
-<script>
-(() => {{
-  const livePreviewUrl = {live_preview_url};
-  const frame = document.querySelector('.live-frame');
-  const horizontal = document.getElementById('live-horizontal');
-  const vertical = document.getElementById('live-vertical');
-  const image = document.getElementById('live-clean-stream');
-  const error = document.getElementById('live-error');
-  if (!frame || !horizontal || !vertical || !image || !error) return;
-
-  function showError(text) {{
-    error.textContent = text;
-    error.style.display = 'block';
-  }}
-
-  function hideError() {{
-    error.style.display = 'none';
-  }}
-
-  let livePreviewRetryTimer = null;
-
-  function scheduleLivePreviewRetry(message) {{
-    if (message) showError(message);
-    if (livePreviewRetryTimer) return;
-    livePreviewRetryTimer = window.setTimeout(() => {{
-      livePreviewRetryTimer = null;
-      attachLivePreview();
-    }}, 3000);
-  }}
-
-  function attachLivePreview() {{
-    image.onload = hideError;
-    image.onerror = () => scheduleLivePreviewRetry('Waiting for live stream...');
-    image.src = `${{livePreviewUrl}}?v=${{Date.now()}}`;
-  }}
-
-  function setOrientation(orientation) {{
-    const isVertical = orientation === 'vertical';
-    frame.classList.toggle('vertical', isVertical);
-    horizontal.classList.toggle('active', !isVertical);
-    vertical.classList.toggle('active', isVertical);
-    horizontal.setAttribute('aria-pressed', String(!isVertical));
-    vertical.setAttribute('aria-pressed', String(isVertical));
-    localStorage.setItem('live-view-orientation', isVertical ? 'vertical' : 'horizontal');
-  }}
-
-  horizontal.addEventListener('click', () => setOrientation('horizontal'));
-  vertical.addEventListener('click', () => setOrientation('vertical'));
-  setOrientation(localStorage.getItem('live-view-orientation') === 'vertical' ? 'vertical' : 'horizontal');
-  attachLivePreview();
 }})();
 </script>
 </body></html>"""
@@ -4837,6 +4854,7 @@ a {{ color: #93c5fd; }}
                     zone.enabled = bool(zone_payload.get("enabled", zone.enabled))
                     zone.use_fast_alpr = bool(zone_payload.get("use_fast_alpr", zone.use_fast_alpr))
                     zone.send_telegram = bool(zone_payload.get("send_telegram", zone.send_telegram))
+                    zone.extract_images = bool(zone_payload.get("extract_images", zone.extract_images))
                     zone.record_seconds = max(1.0, float(zone_payload.get("record_seconds", zone.record_seconds)))
                     zone.image_count = max(1, int(zone_payload.get("image_count", zone.image_count)))
                     zone.coverage_trigger_percent = min(
@@ -4857,6 +4875,7 @@ a {{ color: #93c5fd; }}
                     ",".join(str(float(value)) for value in roi_values),
                     "ROI",
                 ) or primary_zone.roi
+            self._sync_shared_recording_policy()
             self._sync_primary_zone_to_config()
             self._save_runtime_config()
             self._apply_camera_motion_config()
@@ -4912,6 +4931,76 @@ a {{ color: #93c5fd; }}
             handler.end_headers()
             handler.wfile.write(body)
 
+    def _handle_test_motion_event(self, handler: BaseHTTPRequestHandler) -> None:
+        if self.video_recording is not None:
+            body = json.dumps({"error": "A video recording is already active"}).encode("utf-8")
+            handler.send_response(HTTPStatus.CONFLICT)
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+            return
+        if not self.prebuffer:
+            body = json.dumps({"error": "No camera frames are available yet"}).encode("utf-8")
+            handler.send_response(HTTPStatus.CONFLICT)
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+            return
+        timestamp = time.time()
+        zone_ids = self._camera_motion_zone_ids() or {"camera"}
+        record_seconds = self._record_seconds_for_zone_ids(zone_ids)
+        expected_name = f"{self.config.camera_name}_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.mp4"
+        thread = threading.Thread(
+            target=self._run_test_motion_event,
+            args=(timestamp, zone_ids),
+            name="test-motion-event",
+            daemon=True,
+        )
+        thread.start()
+        body = json.dumps(
+            {
+                "ok": True,
+                "message": "Test motion event started",
+                "zone_ids": sorted(zone_ids),
+                "planned_recording_seconds": record_seconds,
+                "expected_video": expected_name,
+            }
+        ).encode("utf-8")
+        handler.send_response(HTTPStatus.ACCEPTED)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    def _run_test_motion_event(self, timestamp: float, zone_ids: Set[str]) -> None:
+        try:
+            frame = self.prebuffer[-1][1].copy()
+            self.last_triggered_zone_ids = set(zone_ids)
+            self._add_event_log(
+                "motion",
+                f"Injected test camera motion event zones={','.join(sorted(zone_ids)) or 'unknown'}",
+                zone_id=self._primary_zone_id_for(zone_ids),
+            )
+            self._start_video_recording(timestamp, zone_ids, confirmed=True)
+            motion_seconds = max(1.0, min(5.0, self.config.event_idle_seconds + 1.0))
+            end_motion_at = time.time() + motion_seconds
+            while time.time() < end_motion_at:
+                now = time.time()
+                if self.prebuffer:
+                    frame = self.prebuffer[-1][1].copy()
+                self._on_motion(now, frame, self.config.min_motion_area, zone_ids)
+                time.sleep(0.5)
+            if self.event is not None:
+                self.event.last_motion_at = time.time() - max(
+                    self.config.event_idle_seconds,
+                    self.config.postbuffer_seconds,
+                ) - 0.1
+                self._finalize_event("test camera motion event complete")
+        except Exception:
+            logging.exception("Failed to run test motion event")
+
     def _handle_telegram_settings_update(self, handler: BaseHTTPRequestHandler) -> None:
         try:
             content_length = int(handler.headers.get("Content-Length", "0"))
@@ -4964,6 +5053,42 @@ a {{ color: #93c5fd; }}
             return self._primary_zone_id_for(self.last_triggered_zone_ids)
         return ""
 
+    def _load_event_log(self) -> None:
+        if not self.event_log_path.exists():
+            return
+        try:
+            lines = self.event_log_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            logging.exception("Failed to load event log from %s", self.event_log_path)
+            return
+        loaded: Deque[dict[str, Any]] = deque(maxlen=100)
+        for line in lines[-100:]:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            if "time_epoch" not in entry or "category" not in entry or "message" not in entry:
+                continue
+            loaded.append(
+                {
+                    "time_epoch": float(entry.get("time_epoch") or time.time()),
+                    "category": str(entry.get("category") or "system"),
+                    "zone_id": str(entry.get("zone_id") or ""),
+                    "message": str(entry.get("message") or ""),
+                }
+            )
+        with self.event_log_lock:
+            self.event_log.extend(loaded)
+
+    def _persist_event_log_entry(self, entry: dict[str, Any]) -> None:
+        try:
+            with self.event_log_path.open("a", encoding="utf-8") as event_file:
+                event_file.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
+        except Exception:
+            logging.exception("Failed to persist event log entry to %s", self.event_log_path)
+
     def _add_event_log(self, category: str, message: str, zone_id: str = "") -> None:
         effective_zone_id = zone_id or self._default_event_log_zone_id(category)
         entry = {
@@ -4974,6 +5099,11 @@ a {{ color: #93c5fd; }}
         }
         with self.event_log_lock:
             self.event_log.append(entry)
+        self._persist_event_log_entry(entry)
+
+    def _watcher_log_path(self) -> Path:
+        log_dir = Path(os.getenv("LOG_OUTPUT_DIR", str(self.config.event_output_dir.parent / "logs"))).expanduser()
+        return log_dir / "watcher.log"
 
     def _event_log_snapshot(self) -> List[dict[str, Any]]:
         with self.event_log_lock:
@@ -5553,6 +5683,17 @@ a {{ color: #93c5fd; }}
         allow_probe: bool = True,
     ) -> float:
         if metadata:
+            for key in ("actual_duration_seconds", "duration_seconds"):
+                try:
+                    duration_seconds = float(metadata.get(key) or 0.0)
+                    if duration_seconds > 0:
+                        return duration_seconds
+                except (TypeError, ValueError):
+                    pass
+            if allow_probe:
+                probed_duration = self._video_duration_seconds_with_ffprobe(video_path)
+                if probed_duration > 0:
+                    return probed_duration
             try:
                 recording_seconds = float(metadata.get("recording_seconds") or 0.0)
                 if recording_seconds > 0:
@@ -5593,7 +5734,12 @@ a {{ color: #93c5fd; }}
         metadata.setdefault("zone_ids", [])
         metadata.setdefault("event_count", 0)
         metadata.setdefault("prebuffer_seconds", 0.0)
-        if float(metadata.get("recording_seconds") or 0.0) <= 0 and recording_seconds > 0:
+        actual_duration_seconds = self._video_duration_seconds_with_ffprobe(video_path)
+        if actual_duration_seconds > 0 and abs(float(metadata.get("actual_duration_seconds") or 0.0) - actual_duration_seconds) > 0.25:
+            metadata["actual_duration_seconds"] = actual_duration_seconds
+            metadata["recording_seconds"] = actual_duration_seconds
+            changed = True
+        elif float(metadata.get("recording_seconds") or 0.0) <= 0 and recording_seconds > 0:
             metadata["recording_seconds"] = recording_seconds
             changed = True
         elif "recording_seconds" not in metadata:
@@ -6299,7 +6445,7 @@ img {{ width: 100%; border-radius: 10px; display: block; max-width: 1100px; }}
                 except Exception:
                     pass
             duration_text = self._format_duration_label(
-                self._saved_video_duration_seconds(video_path, metadata, allow_probe=False)
+                self._saved_video_duration_seconds(video_path, metadata, allow_probe=True)
             )
             zone_dots = "".join(
                 f'<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:{zone_dot_colors.get(z, "#94a3b8")};flex-shrink:0;" title="{html.escape(z)}"></span>'
@@ -6629,6 +6775,39 @@ video {{ width: 100%; border-radius: 10px; display: block; background: #000; }}
                     continue
                 if candidate.is_file():
                     candidate.unlink(missing_ok=True)
+
+    def _handle_clear_logs(self, handler: BaseHTTPRequestHandler) -> None:
+        try:
+            with self.event_log_lock:
+                self.event_log.clear()
+            self.event_log_path.parent.mkdir(parents=True, exist_ok=True)
+            self.event_log_path.write_text("", encoding="utf-8")
+
+            watcher_log_path = self._watcher_log_path()
+            watcher_log_path.parent.mkdir(parents=True, exist_ok=True)
+            watcher_log_path.write_text("", encoding="utf-8")
+
+            logging.info("Logs cleared from dashboard")
+            self._add_event_log("system", "Logs cleared")
+
+            if handler.headers.get("Content-Type", "").startswith("application/json"):
+                body = json.dumps({"cleared": True}).encode("utf-8")
+                handler.send_response(HTTPStatus.OK)
+                handler.send_header("Content-Type", "application/json; charset=utf-8")
+                handler.send_header("Content-Length", str(len(body)))
+                handler.end_headers()
+                handler.wfile.write(body)
+                return
+            handler.send_response(HTTPStatus.SEE_OTHER)
+            handler.send_header("Location", "/")
+            handler.end_headers()
+        except Exception as exc:
+            body = json.dumps({"error": str(exc)}).encode("utf-8")
+            handler.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
 
     def _handle_clear_images(self, handler: BaseHTTPRequestHandler) -> None:
         try:

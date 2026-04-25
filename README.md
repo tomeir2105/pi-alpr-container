@@ -218,6 +218,8 @@ DOCKER_LOG_DRIVER=none
 EVENT_OUTPUT_DIR=/data/events
 IMAGE_OUTPUT_DIR=/data/events/images
 VIDEO_OUTPUT_DIR=/data/events/videos
+LOG_OUTPUT_DIR=/data/logs
+EVENT_LOG_FILE=/data/logs/event-log.jsonl
 PLATE_ROI=0.30,0.45,0.80,0.75
 ```
 

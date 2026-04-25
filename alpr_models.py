@@ -239,6 +239,7 @@ class MotionZone:
     enabled: bool
     use_fast_alpr: bool
     send_telegram: bool
+    extract_images: bool
     record_seconds: float
     image_count: int
     coverage_trigger_percent: float

@@ -2,6 +2,7 @@ import logging
 import os
 import queue
 import re
+import select
 import subprocess
 import threading
 import time
@@ -17,6 +18,10 @@ from alpr_models import Config, VIDEO_WRITER_QUEUE_SECONDS
 
 
 HIKVISION_ALERT_STREAM_PATH = "/ISAPI/Event/notification/alertStream"
+
+
+def _derive_hikvision_channel_url(rtsp_url: str, channel: str) -> str:
+    return re.sub(r"(/Streaming/Channels/)10[12](?=($|[/?#]))", rf"\g<1>{channel}", rtsp_url)
 
 
 def _strip_xml_namespace(tag: str) -> str:
@@ -162,6 +167,9 @@ class HikvisionMotionEventStream:
                 auth=requests.auth.HTTPBasicAuth(self.config.hikvision_user, self.config.hikvision_password),
                 **kwargs,
             )
+        if response.status_code >= 400:
+            message = response.text.strip()[:1000]
+            logging.error("Hikvision API %s %s failed: %s %s", method, path, response.status_code, message)
         response.raise_for_status()
         return response
 
@@ -176,6 +184,9 @@ class HikvisionMotionEventStream:
         root = ET.fromstring(response.content)
         if not (self._configure_grid_motion(root, enabled_zones, sensitivity) or self._configure_region_motion(root, enabled_zones, sensitivity)):
             raise RuntimeError("Unsupported Hikvision motion XML: no grid or region layout found")
+        namespace = _xml_namespace(root.tag)
+        if namespace:
+            ET.register_namespace("", namespace)
         payload = ET.tostring(root, encoding="utf-8", xml_declaration=True)
         self._request(
             "PUT",
@@ -300,13 +311,15 @@ class SingleFfmpegRtspCapture:
         self.segment_dir = segment_dir
         self.transport = transport
         self.process: Optional[subprocess.Popen[bytes]] = None
+        self.stdout_buffer = b""
         self.segment_dir.mkdir(parents=True, exist_ok=True)
 
     def start(self) -> None:
-        self._cleanup_old_segments(force=True)
-        segment_pattern = str(self.segment_dir / "seg-%Y%m%dT%H%M%S.mp4")
+        self._cleanup_old_segments()
         fps = max(1.0, self.config.stream_fps)
         max_width = max(320, int(self.config.frame_width or 960))
+        source_url = os.getenv("ANALYTICS_RTSP_URL", "").strip() or _derive_hikvision_channel_url(self.config.rtsp_url, "102")
+        segment_pattern = self.segment_dir / "seg-%06d.ts"
         command = [
             "ffmpeg",
             "-hide_banner",
@@ -322,23 +335,7 @@ class SingleFfmpegRtspCapture:
             "-fflags",
             "+discardcorrupt",
             "-i",
-            self.config.rtsp_url,
-            "-map",
-            "0:v:0",
-            "-an",
-            "-c:v",
-            "copy",
-            "-f",
-            "segment",
-            "-segment_time",
-            f"{self.config.record_segment_seconds:.3f}",
-            "-segment_format",
-            "mp4",
-            "-reset_timestamps",
-            "1",
-            "-strftime",
-            "1",
-            segment_pattern,
+            source_url,
             "-map",
             "0:v:0",
             "-an",
@@ -351,6 +348,20 @@ class SingleFfmpegRtspCapture:
             "-vcodec",
             "mjpeg",
             "pipe:1",
+            "-map",
+            "0:v:0",
+            "-an",
+            "-c:v",
+            "copy",
+            "-f",
+            "segment",
+            "-segment_time",
+            f"{self.config.record_segment_seconds:.3f}",
+            "-segment_format",
+            "mpegts",
+            "-reset_timestamps",
+            "1",
+            str(segment_pattern),
         ]
         self.process = subprocess.Popen(
             command,
@@ -361,6 +372,7 @@ class SingleFfmpegRtspCapture:
         if self.process.stdout is None:
             self.stop()
             raise RuntimeError("Unable to open ffmpeg RTSP capture")
+        os.set_blocking(self.process.stdout.fileno(), False)
 
     def is_running(self) -> bool:
         return self.process is not None and self.process.poll() is None and self.process.stdout is not None
@@ -369,68 +381,101 @@ class SingleFfmpegRtspCapture:
         if not self.is_running() or self.process is None or self.process.stdout is None:
             raise RuntimeError("ffmpeg RTSP capture is not running")
         deadline = time.time() + timeout_seconds
-        buffer = b""
         while time.time() < deadline:
-            chunk = self.process.stdout.read(65536)
+            start = self.stdout_buffer.find(b"\xff\xd8")
+            if start >= 0:
+                end = self.stdout_buffer.find(b"\xff\xd9", start + 2)
+                if end >= 0:
+                    jpeg_bytes = self.stdout_buffer[start : end + 2]
+                    self.stdout_buffer = self.stdout_buffer[end + 2 :]
+                    frame = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    if frame is not None:
+                        self._cleanup_old_segments()
+                        return frame
+                    continue
+                if start > 0:
+                    self.stdout_buffer = self.stdout_buffer[start:]
+            elif len(self.stdout_buffer) > 2:
+                self.stdout_buffer = self.stdout_buffer[-2:]
+
+            timeout = max(0.0, min(0.25, deadline - time.time()))
+            readable, _, _ = select.select([self.process.stdout], [], [], timeout)
+            if not readable:
+                if self.process.poll() is not None:
+                    raise RuntimeError("ffmpeg RTSP capture exited")
+                continue
+            try:
+                chunk = os.read(self.process.stdout.fileno(), 32768)
+            except BlockingIOError:
+                continue
             if not chunk:
                 if self.process.poll() is not None:
                     raise RuntimeError("ffmpeg RTSP capture exited")
-                time.sleep(0.05)
                 continue
-            buffer += chunk
-            start = buffer.find(b"\xff\xd8")
-            if start < 0:
-                buffer = buffer[-2:]
-                continue
-            end = buffer.find(b"\xff\xd9", start + 2)
-            if end < 0:
-                if start > 0:
-                    buffer = buffer[start:]
-                continue
-            jpeg_bytes = buffer[start : end + 2]
-            frame = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if frame is not None:
-                self._cleanup_old_segments()
-                return frame
+            self.stdout_buffer += chunk
         raise RuntimeError("Timed out waiting for ffmpeg frame")
 
     def copy_clip(self, start_at: float, end_at: float, output_path: Path) -> List[Path]:
-        time.sleep(min(5.0, max(1.0, self.config.record_segment_seconds + 0.5)))
+        self._wait_for_segments_through(end_at)
         segments = self._segments_for_range(start_at, end_at)
         if not segments:
             raise RuntimeError("No stream-copy segments are available for event clip")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         concat_path = output_path.with_suffix(".concat.txt")
+        video_filters = ["format=yuv420p"]
+        if self.config.video_fps > 0:
+            video_filters.insert(0, f"fps={self.config.video_fps:.3f}")
         concat_path.write_text(
             "".join(f"file '{segment.as_posix()}'\n" for segment in segments),
             encoding="utf-8",
         )
         try:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 [
                     "ffmpeg",
                     "-hide_banner",
                     "-loglevel",
                     "error",
                     "-y",
+                    "-fflags",
+                    "+genpts",
                     "-f",
                     "concat",
                     "-safe",
                     "0",
                     "-i",
                     str(concat_path),
-                    "-c",
-                    "copy",
+                    "-an",
+                    "-vf",
+                    ",".join(video_filters),
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "23",
+                    "-threads",
+                    str(self.config.ffmpeg_threads),
+                    "-pix_fmt",
+                    "yuv420p",
                     "-movflags",
                     "+faststart",
                     str(output_path),
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=self.CONCAT_TIMEOUT_SECONDS,
             )
-            if result.returncode != 0:
-                message = result.stderr.decode("utf-8", errors="replace").strip()
+            timeout_seconds = max(self.CONCAT_TIMEOUT_SECONDS, int(max(1.0, end_at - start_at) * 3.0))
+            timeout_at = time.time() + timeout_seconds
+            while process.poll() is None:
+                self._drain_stdout_once(timeout_seconds=0.25)
+                if time.time() > timeout_at:
+                    process.kill()
+                    _, stderr = process.communicate(timeout=5)
+                    raise subprocess.TimeoutExpired(process.args, timeout_seconds, stderr)
+            _, stderr = process.communicate()
+            if process.returncode != 0:
+                message = stderr.decode("utf-8", errors="replace").strip()
                 raise RuntimeError(f"ffmpeg concat failed for {output_path}: {message}")
             return segments
         finally:
@@ -439,6 +484,7 @@ class SingleFfmpegRtspCapture:
     def stop(self) -> None:
         process = self.process
         self.process = None
+        self.stdout_buffer = b""
         if process is None:
             return
         process.terminate()
@@ -451,7 +497,7 @@ class SingleFfmpegRtspCapture:
     def _segments_for_range(self, start_at: float, end_at: float) -> List[Path]:
         segment_slack = max(1.0, self.config.record_segment_seconds * 2.0)
         selected: List[Path] = []
-        for path in sorted(self.segment_dir.glob("seg-*.mp4")):
+        for path in sorted(self.segment_dir.glob("seg-*")):
             try:
                 mtime = path.stat().st_mtime
             except OSError:
@@ -460,9 +506,39 @@ class SingleFfmpegRtspCapture:
                 selected.append(path)
         return selected
 
+    def _wait_for_segments_through(self, end_at: float) -> None:
+        deadline = time.time() + max(30.0, self.config.record_segment_seconds * 8.0)
+        while time.time() < deadline:
+            newest_mtime = 0.0
+            for path in self.segment_dir.glob("seg-*"):
+                try:
+                    newest_mtime = max(newest_mtime, path.stat().st_mtime)
+                except OSError:
+                    continue
+            if newest_mtime >= end_at:
+                return
+            self._drain_stdout_once(timeout_seconds=0.25)
+
+    def _drain_stdout_once(self, timeout_seconds: float = 0.0) -> None:
+        if not self.is_running() or self.process is None or self.process.stdout is None:
+            time.sleep(max(0.0, timeout_seconds))
+            return
+        readable, _, _ = select.select([self.process.stdout], [], [], max(0.0, timeout_seconds))
+        if not readable:
+            return
+        try:
+            chunk = os.read(self.process.stdout.fileno(), 32768)
+        except BlockingIOError:
+            return
+        if chunk:
+            self.stdout_buffer += chunk
+            if len(self.stdout_buffer) > 8 * 1024 * 1024:
+                start = self.stdout_buffer.rfind(b"\xff\xd8")
+                self.stdout_buffer = self.stdout_buffer[start:] if start >= 0 else self.stdout_buffer[-2:]
+
     def _cleanup_old_segments(self, force: bool = False) -> None:
         cutoff = 0.0 if force else time.time() - self.config.record_segment_retention_seconds
-        for path in self.segment_dir.glob("seg-*.mp4"):
+        for path in self.segment_dir.glob("seg-*"):
             try:
                 if force or path.stat().st_mtime < cutoff:
                     path.unlink(missing_ok=True)
@@ -537,11 +613,67 @@ class FfmpegVideoWriter:
             raise RuntimeError(f"ffmpeg failed to write {self.output_path}: {message}")
 
 
+class DirectRtspVideoWriter:
+    FINALIZE_TIMEOUT_SECONDS = 10
+    KILL_TIMEOUT_SECONDS = 5
+
+    def __init__(self, output_path: Path, source_url: str, duration_seconds: float, transport: str) -> None:
+        self.output_path = output_path
+        self.process = subprocess.Popen(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-rtsp_transport",
+                transport,
+                "-i",
+                source_url,
+                "-t",
+                f"{max(1.0, duration_seconds):.3f}",
+                "-map",
+                "0:v:0",
+                "-an",
+                "-c:v",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def isOpened(self) -> bool:
+        return self.process.poll() is None
+
+    def write(self, frame) -> None:
+        return
+
+    def release(self) -> None:
+        try:
+            _, stderr = self.process.communicate(timeout=self.FINALIZE_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            self.process.terminate()
+            try:
+                _, stderr = self.process.communicate(timeout=self.KILL_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired as exc:
+                self.process.kill()
+                _, stderr = self.process.communicate(timeout=self.KILL_TIMEOUT_SECONDS)
+                message = stderr.decode("utf-8", errors="replace").strip() if stderr else ""
+                detail = f": {message}" if message else ""
+                raise RuntimeError(f"ffmpeg timed out finalizing {self.output_path}{detail}") from exc
+        if self.process.returncode not in (0, 255):
+            message = stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"ffmpeg failed to record {self.output_path}: {message}")
+
+
 class QueuedVideoWriter:
     def __init__(self, writer: Any, output_path: Path, fps: float) -> None:
         self.writer = writer
         self.output_path = output_path
-        self.queue: queue.Queue[Optional[Any]] = queue.Queue(maxsize=max(30, int(fps * VIDEO_WRITER_QUEUE_SECONDS)))
+        self.queue: queue.Queue[Optional[Any]] = queue.Queue(maxsize=max(120, int(fps * VIDEO_WRITER_QUEUE_SECONDS * 4)))
         self.error: Optional[Exception] = None
         self.dropped_frames = 0
         self.closed = False
@@ -559,18 +691,18 @@ class QueuedVideoWriter:
             if self.closed:
                 raise RuntimeError(f"video writer is closed for {self.output_path}")
         frame_copy = frame.copy()
-        while True:
+        while self.thread.is_alive():
             try:
-                self.queue.put_nowait(frame_copy)
+                self.queue.put(frame_copy, timeout=1.0)
                 return
             except queue.Full:
-                try:
-                    self.queue.get_nowait()
-                    self.queue.task_done()
-                except queue.Empty:
-                    pass
                 with self.lock:
-                    self.dropped_frames += 1
+                    if self.error:
+                        raise RuntimeError(f"video writer failed for {self.output_path}: {self.error}")
+        with self.lock:
+            if self.error:
+                raise RuntimeError(f"video writer failed for {self.output_path}: {self.error}")
+        raise RuntimeError(f"video writer stopped for {self.output_path}")
 
     def release(self) -> None:
         with self.lock:
@@ -580,13 +712,6 @@ class QueuedVideoWriter:
                 self.queue.put(None, timeout=0.5)
                 break
             except queue.Full:
-                try:
-                    self.queue.get_nowait()
-                    self.queue.task_done()
-                    with self.lock:
-                        self.dropped_frames += 1
-                except queue.Empty:
-                    pass
                 if not self.thread.is_alive():
                     break
         self.thread.join()
