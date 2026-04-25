@@ -20,8 +20,8 @@ Persistent data is stored under:
 ## How it works
 
 1. The script opens one RTSP stream.
-2. It watches a configurable road region of interest (ROI).
-3. When motion in that ROI looks vehicle-sized for several consecutive checks, it starts an event.
+2. It registers the dashboard motion zones with the Hikvision motion-detection API.
+3. When the camera emits a Hikvision VMD event, it starts an event.
 4. It keeps a short pre-roll and post-roll buffer so the saved clip includes the full pass.
 5. It records event video from rolling stream-copy segments without software re-encoding on the Pi.
 6. If the triggered zone has `Fast-ALPR` enabled, it extracts event images and runs `fast-alpr` first.
@@ -31,6 +31,7 @@ Persistent data is stored under:
 ## Files
 
 - `alpr_watcher.py`: main watcher service
+- `hikvision_motion_api.py`: standalone Hikvision ISAPI motion/event utility
 - `.env.example`: environment variables to copy into `.env`
 - `requirements.txt`: Python dependencies
 - `docker-compose.yml`: watcher-only stack
@@ -101,7 +102,7 @@ When the watcher is running, open:
 
 ## Web UI
 
-- The dashboard shows the live camera view, editable motion zones, and motion sensitivity controls.
+- The dashboard shows the live camera view, editable Hikvision motion zones, and Hikvision sensitivity controls.
 - The config page edits `.env`; recreate the watcher container after saving Docker env-file changes.
 - The images page opens image details in the same tab and supports keyboard navigation: left arrow for newer images, right arrow for older images.
 - The videos page supports local uploads, manual image extraction from video, snapshot-to-ALPR, and clip playback.
@@ -112,6 +113,9 @@ When the watcher is running, open:
 
 - `ROI` should cover only the driveway or road where cars pass.
 - The watcher pulls one camera stream. With `SINGLE_FFMPEG_CAPTURE=true`, ffmpeg continuously writes short copied MP4 segments under `/data/events/videos/recording-tmp/stream-segments` and emits reduced JPEG frames for motion detection/dashboard from the same connection.
+- `USE_CAMERA_MOTION_API=true` trusts Hikvision VMD events instead of running local OpenCV motion analysis. The UI saves zones and sensitivity back to the camera through ISAPI.
+- `HIKVISION_MOTION_SENSITIVITY` uses Hikvision's 1-100 sensitivity scale.
+- `HIKVISION_REGISTRATION_REFRESH_SECONDS` re-applies the UI zones and sensitivity to the camera periodically; set `0` to disable.
 - `PLATE_ROI` can be a tighter sub-zone where plates are expected to appear; this crops frames before ALPR runs.
 - `FRAME_WIDTH=960` keeps processing and dashboard streaming bounded. It does not downscale saved stream-copy motion clips.
 - `MIN_MOTION_AREA` filters out tiny motion like rain, trees, and shadows.
@@ -183,6 +187,16 @@ MANUAL_EXTRACT_IMAGE_COUNT=20
 UPLOAD_MIN_SHARPNESS=80.0
 FAST_ALPR_URL=http://192.168.1.50:8090
 FAST_ALPR_MIN_CONFIDENCE=0.75
+USE_CAMERA_MOTION_API=true
+HIKVISION_HOST=camera-host
+HIKVISION_USER=username
+HIKVISION_PASSWORD=password
+HIKVISION_SCHEME=http
+HIKVISION_PORT=0
+HIKVISION_CHANNEL=1
+HIKVISION_MOTION_SENSITIVITY=60
+HIKVISION_EVENT_TIMEOUT_SECONDS=10
+HIKVISION_REGISTRATION_REFRESH_SECONDS=60
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 TELEGRAM_ALERT_IMAGES=3

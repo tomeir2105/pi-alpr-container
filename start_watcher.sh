@@ -28,7 +28,7 @@ if command -v vcgencmd >/dev/null 2>&1; then
   vcgencmd get_throttled || true
 fi
 echo "Active stream config:"
-grep -nE '^(RTSP_URL|ALPR_RTSP_URL)=' "$APP_ENV_FILE" || true
+grep -nE '^(RTSP_URL|HIKVISION_HOST|HIKVISION_CHANNEL|USE_CAMERA_MOTION_API)=' "$APP_ENV_FILE" || true
 
 cd "$SCRIPT_DIR" || exit 1
 docker compose up -d --build --force-recreate watcher

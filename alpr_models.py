@@ -96,6 +96,16 @@ class Config:
     ffmpeg_probe_size: str
     record_segment_seconds: float
     record_segment_retention_seconds: float
+    use_camera_motion_api: bool
+    hikvision_host: str
+    hikvision_user: str
+    hikvision_password: str
+    hikvision_scheme: str
+    hikvision_port: int
+    hikvision_channel: int
+    hikvision_motion_sensitivity: int
+    hikvision_event_timeout_seconds: float
+    hikvision_registration_refresh_seconds: float
     alpr_capture_fps: float
     alpr_capture_warmup_seconds: float
     live_stream_warmup_seconds: float
@@ -186,6 +196,19 @@ class Config:
             record_segment_retention_seconds=max(
                 30.0,
                 float(getenv("RECORD_SEGMENT_RETENTION_SECONDS", str(DEFAULT_RECORD_SEGMENT_RETENTION_SECONDS))),
+            ),
+            use_camera_motion_api=parse_bool(getenv("USE_CAMERA_MOTION_API", "true"), default=True),
+            hikvision_host=getenv("HIKVISION_HOST").strip(),
+            hikvision_user=(getenv("HIKVISION_USER") or getenv("HIKVISION_USERNAME")).strip(),
+            hikvision_password=getenv("HIKVISION_PASSWORD").strip(),
+            hikvision_scheme=getenv("HIKVISION_SCHEME", "http").strip() or "http",
+            hikvision_port=max(0, int(getenv("HIKVISION_PORT", "0"))),
+            hikvision_channel=max(1, int(getenv("HIKVISION_CHANNEL", "1"))),
+            hikvision_motion_sensitivity=min(100, max(1, int(getenv("HIKVISION_MOTION_SENSITIVITY", "60")))),
+            hikvision_event_timeout_seconds=max(1.0, float(getenv("HIKVISION_EVENT_TIMEOUT_SECONDS", "10.0"))),
+            hikvision_registration_refresh_seconds=max(
+                0.0,
+                float(getenv("HIKVISION_REGISTRATION_REFRESH_SECONDS", "60.0")),
             ),
             alpr_capture_fps=max(0.1, float(getenv("ALPR_CAPTURE_FPS", str(DEFAULT_ALPR_CAPTURE_FPS)))),
             alpr_capture_warmup_seconds=max(0.0, float(getenv("ALPR_CAPTURE_WARMUP_SECONDS", "1.5"))),

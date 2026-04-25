@@ -44,7 +44,13 @@ from alpr_models import (
     parse_normalized_roi,
     redact_url_credentials,
 )
-from alpr_services import FfmpegVideoWriter, OpenAlprClient, QueuedVideoWriter, SingleFfmpegRtspCapture
+from alpr_services import (
+    FfmpegVideoWriter,
+    HikvisionMotionEventStream,
+    OpenAlprClient,
+    QueuedVideoWriter,
+    SingleFfmpegRtspCapture,
+)
 
 
 class RtspVehicleWatcher:
@@ -54,6 +60,10 @@ class RtspVehicleWatcher:
         self.motion_zones = self._default_motion_zones()
         self._load_runtime_config()
         self.client = OpenAlprClient(config)
+        self.camera_motion_stream = HikvisionMotionEventStream(config)
+        self.camera_motion_config_lock = threading.Lock()
+        self.camera_motion_refresh_stop = threading.Event()
+        self.camera_motion_refresh_thread: Optional[threading.Thread] = None
         self.prebuffer: Deque[Tuple[float, Any]] = deque(maxlen=max(500, int(MAX_VIDEO_PREBUFFER_FRAMES * 2)))
         self.event: Optional[Event] = None
         self.motion_streak = 0
@@ -119,6 +129,20 @@ class RtspVehicleWatcher:
         primary_roi = self.config.roi or (0.05, 0.35, 0.95, 0.95)
         return [
             MotionZone(
+                zone_id="camera",
+                label="Camera motion",
+                roi=primary_roi,
+                enabled=True,
+                use_fast_alpr=True,
+                send_telegram=self.config.telegram_alerts_enabled,
+                record_seconds=max(1.0, VIDEO_RECORDING_SECONDS),
+                image_count=max(1, self.config.upload_top_frames),
+                coverage_trigger_percent=0.0,
+                color_hex="#38bdf8",
+                fill_rgba="rgba(56,189,248,0.12)",
+                overlay_bgr=(248, 189, 56),
+            ),
+            MotionZone(
                 zone_id="yellow",
                 label="Yellow zone",
                 roi=primary_roi,
@@ -171,6 +195,50 @@ class RtspVehicleWatcher:
 
     def _image_limit_for_zone_ids(self, zone_ids: Set[str]) -> int:
         return max((zone.image_count for zone in self._zones_for_policy(zone_ids)), default=max(1, self.config.upload_top_frames))
+
+    def _apply_camera_motion_config(self) -> None:
+        if not self.config.use_camera_motion_api or not self.camera_motion_stream.configured():
+            return
+        api_zones = [zone for zone in self.motion_zones if zone.zone_id != "camera"]
+        with self.camera_motion_config_lock:
+            self.camera_motion_stream.apply_motion_settings(
+                api_zones,
+                self.config.hikvision_motion_sensitivity,
+            )
+        logging.info(
+            "Applied Hikvision motion API zones=%s sensitivity=%s",
+            ",".join(zone.zone_id for zone in api_zones if zone.enabled) or "none",
+            self.config.hikvision_motion_sensitivity,
+        )
+
+    def _start_camera_motion_config_refresh(self) -> None:
+        if self.camera_motion_refresh_thread is not None:
+            return
+        if not self.config.use_camera_motion_api or self.config.hikvision_registration_refresh_seconds <= 0:
+            return
+        if not self.camera_motion_stream.configured():
+            return
+        self.camera_motion_refresh_stop.clear()
+        self.camera_motion_refresh_thread = threading.Thread(
+            target=self._camera_motion_config_refresh_loop,
+            name="hikvision-motion-config-refresh",
+            daemon=True,
+        )
+        self.camera_motion_refresh_thread.start()
+
+    def _stop_camera_motion_config_refresh(self) -> None:
+        self.camera_motion_refresh_stop.set()
+        if self.camera_motion_refresh_thread is not None:
+            self.camera_motion_refresh_thread.join(timeout=3.0)
+            self.camera_motion_refresh_thread = None
+
+    def _camera_motion_config_refresh_loop(self) -> None:
+        while not self.camera_motion_refresh_stop.wait(self.config.hikvision_registration_refresh_seconds):
+            try:
+                self._apply_camera_motion_config()
+                logging.info("Refreshed Hikvision motion API registration")
+            except Exception:
+                logging.exception("Failed to refresh Hikvision motion API registration")
 
     def _load_runtime_config(self) -> None:
         try:
@@ -228,6 +296,9 @@ class RtspVehicleWatcher:
                 self.config.min_motion_area = clamped_min_motion_area
             if legacy_telegram_alerts_enabled is not None:
                 self.config.telegram_alerts_enabled = legacy_telegram_default
+            motion_sensitivity = payload.get("hikvision_motion_sensitivity")
+            if motion_sensitivity is not None:
+                self.config.hikvision_motion_sensitivity = min(100, max(1, int(motion_sensitivity)))
             self._sync_primary_zone_to_config()
             if should_resave:
                 self._save_runtime_config()
@@ -256,8 +327,10 @@ class RtspVehicleWatcher:
                             "coverage_trigger_percent": zone.coverage_trigger_percent,
                         }
                         for zone in self.motion_zones
+                        if zone.zone_id != "camera"
                     ],
                     "min_motion_area": int(self.config.min_motion_area),
+                    "hikvision_motion_sensitivity": int(self.config.hikvision_motion_sensitivity),
                     "telegram_alerts_enabled": bool(self.config.telegram_alerts_enabled),
                 },
                 indent=2,
@@ -451,6 +524,12 @@ class RtspVehicleWatcher:
 
     def _run_capture_loop(self) -> None:
         logging.info("Connecting to RTSP stream")
+        try:
+            self._apply_camera_motion_config()
+        except Exception:
+            logging.exception("Failed to apply Hikvision motion API config; continuing with current camera config")
+        self.camera_motion_stream.start()
+        self._start_camera_motion_config_refresh()
         os.environ.setdefault(
             "OPENCV_FFMPEG_CAPTURE_OPTIONS",
             self.config.rtsp_capture_options,
@@ -549,82 +628,96 @@ class RtspVehicleWatcher:
                 frame = self._resize_frame(original_frame)
                 self._push_prebuffer(timestamp, original_frame)
 
-                # During active recording, process fewer frames to free CPU for ffmpeg
-                process_interval = self.config.process_every_n_frames * 3 if self.video_recording is not None else self.config.process_every_n_frames
-                process_this_frame = self.frame_index % process_interval == 0
                 motion_area = self.last_motion_area
                 had_motion = False
                 triggered_zone_ids: Set[str] = set()
                 overlay = self._draw_monitor_overlays(frame.copy())
 
-                raw_motion = False
-                if process_this_frame:
-                    (
-                        motion_area,
-                        raw_motion,
-                        best_box,
-                        overlay,
-                        triggered_zone_ids,
-                        zone_area_by_id,
-                        zone_coverage_percent_by_id,
-                        zone_motion_masks_by_id,
-                    ) = self._detect_motion(frame)
-                    if raw_motion:
-                        self.motion_streak = min(self.config.min_consecutive_hits, self.motion_streak + 1)
-                        self.last_triggered_zone_ids = set(triggered_zone_ids)
-                    else:
-                        self.motion_streak = max(0, self.motion_streak - 1)
-                        if self.motion_streak == 0:
-                            self.last_triggered_zone_ids = set()
-                    should_accumulate_coverage = raw_motion or self.motion_streak > 0
-                    if should_accumulate_coverage:
-                        (
-                            zone_coverage_percent_by_id,
-                            coverage_triggered_zone_ids,
-                        ) = self._update_cumulative_zone_coverage(zone_motion_masks_by_id)
-                    else:
-                        self._reset_coverage_accumulators()
-                        coverage_triggered_zone_ids = set()
-                    coverage_confirmed = bool(coverage_triggered_zone_ids)
-                    if coverage_confirmed:
-                        self.last_triggered_zone_ids.update(coverage_triggered_zone_ids)
-                    streak_confirmed = self.motion_streak >= self.config.min_consecutive_hits
-                    coverage_can_start_event = coverage_confirmed and self.event is None
-                    had_motion = streak_confirmed or coverage_can_start_event
+                if self.config.use_camera_motion_api and self.camera_motion_stream.configured():
+                    had_motion, triggered_zone_ids, api_status = self._camera_api_motion_state(timestamp)
+                    self.motion_streak = self.config.min_consecutive_hits if had_motion else 0
+                    self.last_triggered_zone_ids = set(triggered_zone_ids)
+                    self.last_zone_area_by_id = {zone_id: 1 for zone_id in triggered_zone_ids}
+                    self.last_zone_coverage_percent_by_id = {zone_id: 100.0 for zone_id in triggered_zone_ids}
+                    self.last_coverage_triggered_zone_ids = set(triggered_zone_ids)
+                    motion_area = 1 if had_motion else 0
                     self.last_motion_area = motion_area
-                    self.last_motion_box = best_box
-                    self.last_zone_area_by_id = dict(zone_area_by_id)
-                    self.last_zone_coverage_percent_by_id = dict(zone_coverage_percent_by_id)
-                    self.last_coverage_triggered_zone_ids = set(coverage_triggered_zone_ids)
-                    overlay = self._annotate_motion_overlay(
-                        overlay,
-                        motion_area,
-                        best_box,
-                        had_motion,
-                        triggered_zone_ids if triggered_zone_ids else self.last_triggered_zone_ids,
-                        zone_area_by_id,
-                        zone_coverage_percent_by_id,
-                        coverage_triggered_zone_ids,
-                    )
-                    if self.config.debug_windows:
-                        cv2.imshow("watcher", overlay)
-                        cv2.waitKey(1)
-                    if raw_motion:
-                        self._start_video_recording(timestamp, triggered_zone_ids, confirmed=False)
-                    elif not self.event and self.motion_streak == 0:
+                    self.last_motion_box = None
+                    self.latest_motion_status = api_status
+                    if not had_motion and not self.event:
                         self._discard_unconfirmed_video_recording()
                 else:
-                    had_motion = self.motion_streak >= self.config.min_consecutive_hits
-                    overlay = self._annotate_motion_overlay(
-                        overlay,
-                        motion_area,
-                        self.last_motion_box,
-                        had_motion,
-                        self.last_triggered_zone_ids,
-                        self.last_zone_area_by_id,
-                        self.last_zone_coverage_percent_by_id,
-                        self.last_coverage_triggered_zone_ids,
-                    )
+                    # Fallback for non-Hikvision cameras or API outages.
+                    process_interval = self.config.process_every_n_frames * 3 if self.video_recording is not None else self.config.process_every_n_frames
+                    process_this_frame = self.frame_index % process_interval == 0
+                    raw_motion = False
+                    if process_this_frame:
+                        (
+                            motion_area,
+                            raw_motion,
+                            best_box,
+                            overlay,
+                            triggered_zone_ids,
+                            zone_area_by_id,
+                            zone_coverage_percent_by_id,
+                            zone_motion_masks_by_id,
+                        ) = self._detect_motion(frame)
+                        if raw_motion:
+                            self.motion_streak = min(self.config.min_consecutive_hits, self.motion_streak + 1)
+                            self.last_triggered_zone_ids = set(triggered_zone_ids)
+                        else:
+                            self.motion_streak = max(0, self.motion_streak - 1)
+                            if self.motion_streak == 0:
+                                self.last_triggered_zone_ids = set()
+                        should_accumulate_coverage = raw_motion or self.motion_streak > 0
+                        if should_accumulate_coverage:
+                            (
+                                zone_coverage_percent_by_id,
+                                coverage_triggered_zone_ids,
+                            ) = self._update_cumulative_zone_coverage(zone_motion_masks_by_id)
+                        else:
+                            self._reset_coverage_accumulators()
+                            coverage_triggered_zone_ids = set()
+                        coverage_confirmed = bool(coverage_triggered_zone_ids)
+                        if coverage_confirmed:
+                            self.last_triggered_zone_ids.update(coverage_triggered_zone_ids)
+                        streak_confirmed = self.motion_streak >= self.config.min_consecutive_hits
+                        coverage_can_start_event = coverage_confirmed and self.event is None
+                        had_motion = streak_confirmed or coverage_can_start_event
+                        self.last_motion_area = motion_area
+                        self.last_motion_box = best_box
+                        self.last_zone_area_by_id = dict(zone_area_by_id)
+                        self.last_zone_coverage_percent_by_id = dict(zone_coverage_percent_by_id)
+                        self.last_coverage_triggered_zone_ids = set(coverage_triggered_zone_ids)
+                        overlay = self._annotate_motion_overlay(
+                            overlay,
+                            motion_area,
+                            best_box,
+                            had_motion,
+                            triggered_zone_ids if triggered_zone_ids else self.last_triggered_zone_ids,
+                            zone_area_by_id,
+                            zone_coverage_percent_by_id,
+                            coverage_triggered_zone_ids,
+                        )
+                        if self.config.debug_windows:
+                            cv2.imshow("watcher", overlay)
+                            cv2.waitKey(1)
+                        if raw_motion:
+                            self._start_video_recording(timestamp, triggered_zone_ids, confirmed=False)
+                        elif not self.event and self.motion_streak == 0:
+                            self._discard_unconfirmed_video_recording()
+                    else:
+                        had_motion = self.motion_streak >= self.config.min_consecutive_hits
+                        overlay = self._annotate_motion_overlay(
+                            overlay,
+                            motion_area,
+                            self.last_motion_box,
+                            had_motion,
+                            self.last_triggered_zone_ids,
+                            self.last_zone_area_by_id,
+                            self.last_zone_coverage_percent_by_id,
+                            self.last_coverage_triggered_zone_ids,
+                        )
 
                 self._update_latest_frames(overlay, frame)
 
@@ -664,6 +757,8 @@ class RtspVehicleWatcher:
             capture_stop.set()
             capture_thread.join(timeout=2.0)
             self._stop_video_recording()
+            self._stop_camera_motion_config_refresh()
+            self.camera_motion_stream.stop()
             if self.single_capture is not None:
                 self.single_capture.stop()
                 self.single_capture = None
@@ -1443,6 +1538,8 @@ class RtspVehicleWatcher:
 
     def _alpr_crop_zone(self, zone_ids: Optional[Set[str]] = None) -> Optional[MotionZone]:
         if zone_ids:
+            if "camera" in zone_ids:
+                return None
             for zone in self.motion_zones:
                 if zone.zone_id in zone_ids and zone.enabled and zone.use_fast_alpr:
                     return zone
@@ -1459,11 +1556,25 @@ class RtspVehicleWatcher:
 
     def _draw_monitor_overlays(self, frame):
         for zone in self.motion_zones:
+            if zone.zone_id == "camera":
+                continue
             if not zone.enabled:
                 continue
             zone_x1, zone_y1, zone_x2, zone_y2 = self._zone_bounds(frame, zone)
             cv2.rectangle(frame, (zone_x1, zone_y1), (zone_x2, zone_y2), zone.overlay_bgr, 2)
         return frame
+
+    def _camera_motion_zone_ids(self) -> Set[str]:
+        camera_zone = self._find_motion_zone("camera")
+        return {camera_zone.zone_id} if camera_zone else set()
+
+    def _camera_api_motion_state(self, timestamp: float) -> Tuple[bool, Set[str], str]:
+        active, last_event_at, summary = self.camera_motion_stream.snapshot()
+        if active and last_event_at > 0 and timestamp - last_event_at > max(5.0, self.config.event_idle_seconds * 4.0):
+            active = False
+            summary = f"{summary}; stale active event timed out"
+        zone_ids = self._camera_motion_zone_ids() if active else set()
+        return active, zone_ids, summary
 
     def _detect_motion(
         self,
@@ -2508,6 +2619,10 @@ class RtspVehicleWatcher:
                             "roi": watcher._roi_value_for_ui(),
                             "zones": watcher._zones_for_ui(),
                             "min_motion_area": int(watcher.config.min_motion_area),
+                            "motion_sensitivity": int(watcher.config.hikvision_motion_sensitivity),
+                            "motion_source": "hikvision_api"
+                            if watcher.config.use_camera_motion_api and watcher.camera_motion_stream.configured()
+                            else "local_video_analysis",
                         }
                     )
                     return
@@ -2866,6 +2981,7 @@ class RtspVehicleWatcher:
                 "fill": zone.fill_rgba,
             }
             for zone in self.motion_zones
+            if zone.zone_id != "camera"
         ]
 
     def _telegram_settings_for_ui(self) -> dict[str, Any]:
@@ -2955,12 +3071,12 @@ class RtspVehicleWatcher:
     <span id="roi-status" style="color:#cbd5e1;">Motion zones: loading...</span>
   </div>
   <div style="margin-top:16px;">
-    <label for="motion-sensitivity" style="display:block; margin-bottom:8px; color:#cbd5e1;">Motion sensitivity</label>
-    <input id="motion-sensitivity" type="range" min="{MIN_ALLOWED_MOTION_AREA}" max="20000" step="250" style="width:100%;">
+    <label for="motion-sensitivity" style="display:block; margin-bottom:8px; color:#cbd5e1;">Hikvision motion sensitivity</label>
+    <input id="motion-sensitivity" type="range" min="1" max="100" step="1" style="width:100%;">
     <div style="display:flex; justify-content:space-between; gap:12px; margin-top:6px; color:#cbd5e1; font-size:0.95rem;">
-      <span>Smaller motion</span>
-      <span id="motion-sensitivity-value">Threshold: loading...</span>
-      <span>Larger motion</span>
+      <span>Less sensitive</span>
+      <span id="motion-sensitivity-value">Sensitivity: loading...</span>
+      <span>More sensitive</span>
     </div>
     <button id="motion-sensitivity-save" type="button" style="margin-top:12px; background:#38bdf8; color:#082f49; border:0; border-radius:10px; padding:10px 16px; cursor:pointer; font-weight:700;">Save Sensitivity</button>
   </div>
@@ -2968,12 +3084,12 @@ class RtspVehicleWatcher:
 
     def _render_roi_editor_script(self) -> str:
         zones_json = json.dumps(self._zones_for_ui())
-        min_motion_area = int(self.config.min_motion_area)
+        motion_sensitivity = int(self.config.hikvision_motion_sensitivity)
         live_preview_url = json.dumps("/stream.mjpg")
         return f"""<script>
 (() => {{
   const initialZones = {zones_json};
-  let initialMotionArea = {min_motion_area};
+  let initialMotionSensitivity = {motion_sensitivity};
   const livePreviewUrl = {live_preview_url};
   const editor = document.getElementById('roi-editor');
   const overlay = document.getElementById('roi-overlay');
@@ -3023,7 +3139,7 @@ class RtspVehicleWatcher:
   let activeZoneId = null;
   let dragCorner = null;
   let dragMove = null;
-  let currentMotionArea = initialMotionArea;
+  let currentMotionSensitivity = initialMotionSensitivity;
   const minSize = 0.03;
   const handleSize = 18;
 
@@ -3118,8 +3234,8 @@ class RtspVehicleWatcher:
   }}
 
   function renderSensitivity() {{
-    sensitivity.value = String(currentMotionArea);
-    sensitivityValue.textContent = `Threshold: ${{currentMotionArea}}`;
+    sensitivity.value = String(currentMotionSensitivity);
+    sensitivityValue.textContent = `Sensitivity: ${{currentMotionSensitivity}} / 100`;
   }}
 
   function findZone(zoneId) {{
@@ -3373,7 +3489,7 @@ class RtspVehicleWatcher:
   }});
 
   sensitivity.addEventListener('input', () => {{
-    currentMotionArea = Number(sensitivity.value);
+    currentMotionSensitivity = Number(sensitivity.value);
     renderSensitivity();
   }});
 
@@ -3404,14 +3520,14 @@ class RtspVehicleWatcher:
       const response = await fetch('/api/motion-settings', {{
         method: 'POST',
         headers: {{ 'Content-Type': 'application/json' }},
-        body: JSON.stringify({{ min_motion_area: currentMotionArea }}),
+        body: JSON.stringify({{ motion_sensitivity: currentMotionSensitivity }}),
       }});
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || 'Save failed');
-      currentMotionArea = Number(payload.min_motion_area);
-      initialMotionArea = currentMotionArea;
+      currentMotionSensitivity = Number(payload.motion_sensitivity);
+      initialMotionSensitivity = currentMotionSensitivity;
       renderSensitivity();
-      setStatus(`Saved sensitivity threshold: ${{currentMotionArea}}`);
+      setStatus(`Saved Hikvision sensitivity: ${{currentMotionSensitivity}} / 100`);
     }} catch (error) {{
       setStatus(error.message || 'Save failed', true);
     }}
@@ -4743,7 +4859,14 @@ a {{ color: #93c5fd; }}
                 ) or primary_zone.roi
             self._sync_primary_zone_to_config()
             self._save_runtime_config()
-            body = json.dumps({"roi": self._roi_value_for_ui(), "zones": self._zones_for_ui()}).encode("utf-8")
+            self._apply_camera_motion_config()
+            body = json.dumps(
+                {
+                    "roi": self._roi_value_for_ui(),
+                    "zones": self._zones_for_ui(),
+                    "motion_sensitivity": int(self.config.hikvision_motion_sensitivity),
+                }
+            ).encode("utf-8")
             handler.send_response(HTTPStatus.OK)
             handler.send_header("Content-Type", "application/json; charset=utf-8")
             handler.send_header("Content-Length", str(len(body)))
@@ -4761,12 +4884,21 @@ a {{ color: #93c5fd; }}
         try:
             content_length = int(handler.headers.get("Content-Length", "0"))
             payload = json.loads(handler.rfile.read(content_length) or b"{}")
-            min_motion_area = int(payload.get("min_motion_area"))
-            if min_motion_area < MIN_ALLOWED_MOTION_AREA:
-                raise ValueError(f"min_motion_area must be at least {MIN_ALLOWED_MOTION_AREA}")
-            self.config.min_motion_area = min_motion_area
+            if "motion_sensitivity" in payload:
+                sensitivity = int(payload.get("motion_sensitivity"))
+            else:
+                sensitivity = int(payload.get("min_motion_area"))
+            if not (1 <= sensitivity <= 100):
+                raise ValueError("Hikvision motion sensitivity must be between 1 and 100")
+            self.config.hikvision_motion_sensitivity = sensitivity
             self._save_runtime_config()
-            body = json.dumps({"min_motion_area": int(self.config.min_motion_area)}).encode("utf-8")
+            self._apply_camera_motion_config()
+            body = json.dumps(
+                {
+                    "motion_sensitivity": int(self.config.hikvision_motion_sensitivity),
+                    "min_motion_area": int(self.config.min_motion_area),
+                }
+            ).encode("utf-8")
             handler.send_response(HTTPStatus.OK)
             handler.send_header("Content-Type", "application/json; charset=utf-8")
             handler.send_header("Content-Length", str(len(body)))
@@ -5000,10 +5132,24 @@ a {{ color: #93c5fd; }}
                 "ffmpeg_probe_size",
                 "record_segment_seconds",
                 "record_segment_retention_seconds",
+                "use_camera_motion_api",
+                "hikvision_host",
+                "hikvision_user",
+                "hikvision_password",
+                "hikvision_scheme",
+                "hikvision_port",
+                "hikvision_channel",
+                "hikvision_event_timeout_seconds",
+                "hikvision_registration_refresh_seconds",
             }
         ]
         self.config = new_config
         self.client = OpenAlprClient(self.config)
+        self._stop_camera_motion_config_refresh()
+        self.camera_motion_stream.stop()
+        self.camera_motion_stream = HikvisionMotionEventStream(self.config)
+        self.camera_motion_stream.start()
+        self._start_camera_motion_config_refresh()
         self.config.event_output_dir.mkdir(parents=True, exist_ok=True)
         self.config.image_output_dir.mkdir(parents=True, exist_ok=True)
         self.config.video_output_dir.mkdir(parents=True, exist_ok=True)

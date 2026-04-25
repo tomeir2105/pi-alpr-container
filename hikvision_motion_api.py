@@ -269,10 +269,11 @@ def show_motion_config(session: requests.Session, config: CameraConfig, channel:
 
 
 def zone_to_grid_map(zones: List[AlertZone], rows: int, columns: int) -> str:
-    cells: List[str] = []
+    encoded_rows: List[str] = []
     for row in range(rows):
         cell_y1 = row / rows
         cell_y2 = (row + 1) / rows
+        bits: List[str] = []
         for column in range(columns):
             cell_x1 = column / columns
             cell_x2 = (column + 1) / columns
@@ -280,8 +281,11 @@ def zone_to_grid_map(zones: List[AlertZone], rows: int, columns: int) -> str:
                 cell_x2 > zone.x1 and cell_x1 < zone.x2 and cell_y2 > zone.y1 and cell_y1 < zone.y2
                 for zone in zones
             )
-            cells.append("1" if enabled else "0")
-    return "".join(cells)
+            bits.append("1" if enabled else "0")
+        while len(bits) % 4:
+            bits.append("0")
+        encoded_rows.append(f"{int(''.join(bits), 2):0{len(bits) // 4}x}")
+    return "".join(encoded_rows)
 
 
 def configure_grid_motion(root: ET.Element, zones: List[AlertZone]) -> bool:
@@ -459,7 +463,7 @@ def follow_alert_stream(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Test Hikvision ISAPI motion/events from a DS-2CD2085G1-I or similar camera."
+        description="Inspect and control Hikvision ISAPI motion/events from a DS-2CD2085G1-I or similar camera."
     )
     parser.add_argument("--host", help="Camera host/IP. Defaults to HIKVISION_HOST or RTSP_URL host.")
     parser.add_argument("--username", help="Camera username. Defaults to HIKVISION_USER or RTSP_URL username.")
@@ -480,7 +484,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--apply-alert-zones",
         action="store_true",
-        help="Write HIKVISION_ALERT_ZONE_1/2 from .env into the camera motion-detection region config before listening.",
+        help="Write HIKVISION_ALERT_ZONE_1/2 from .env into the camera motion-detection config before listening.",
     )
     parser.add_argument("--all-events", action="store_true", help="Print every ISAPI event instead of motion-like events only.")
     parser.add_argument("--once", action="store_true", help="Exit after the first matching event.")

@@ -1,17 +1,294 @@
 import logging
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Iterator, List, Optional, Tuple
 
 import cv2
 import numpy as np
 import requests
 
 from alpr_models import Config, VIDEO_WRITER_QUEUE_SECONDS
+
+
+HIKVISION_ALERT_STREAM_PATH = "/ISAPI/Event/notification/alertStream"
+
+
+def _strip_xml_namespace(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _xml_child_text(root: ET.Element, name: str) -> str:
+    for element in root.iter():
+        if _strip_xml_namespace(element.tag) == name and element.text:
+            return element.text.strip()
+    return ""
+
+
+def _xml_first_element(root: ET.Element, name: str) -> Optional[ET.Element]:
+    for element in root.iter():
+        if _strip_xml_namespace(element.tag) == name:
+            return element
+    return None
+
+
+def _xml_child_element(root: ET.Element, name: str) -> Optional[ET.Element]:
+    for element in list(root):
+        if _strip_xml_namespace(element.tag) == name:
+            return element
+    return None
+
+
+def _xml_namespace(tag: str) -> str:
+    if tag.startswith("{") and "}" in tag:
+        return tag[1:].split("}", 1)[0]
+    return ""
+
+
+def _xml_tag_like(parent: ET.Element, local_name: str) -> str:
+    namespace = _xml_namespace(parent.tag)
+    return f"{{{namespace}}}{local_name}" if namespace else local_name
+
+
+def _xml_ensure_child(parent: ET.Element, local_name: str) -> ET.Element:
+    existing = _xml_child_element(parent, local_name)
+    if existing is not None:
+        return existing
+    return ET.SubElement(parent, _xml_tag_like(parent, local_name))
+
+
+def _hikvision_xml_payloads(chunks: Iterator[bytes]) -> Iterator[bytes]:
+    buffer = b""
+    for chunk in chunks:
+        if not chunk:
+            continue
+        buffer += chunk
+        while True:
+            start_match = re.search(rb"<[A-Za-z0-9_:.-]*EventNotificationAlert\b", buffer)
+            if not start_match:
+                buffer = buffer[-2048:]
+                break
+            start = start_match.start()
+            end_match = re.search(rb"</[A-Za-z0-9_:.-]*EventNotificationAlert>", buffer[start:])
+            if not end_match:
+                if start > 0:
+                    buffer = buffer[start:]
+                break
+            end = start + end_match.end()
+            yield buffer[start:end]
+            buffer = buffer[end:]
+
+
+class HikvisionMotionEventStream:
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.session = requests.Session()
+        self.stop_event = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        self.lock = threading.Lock()
+        self.active = False
+        self.last_event_at = 0.0
+        self.last_summary = "Hikvision motion API: not connected"
+        self.error_count = 0
+
+    def configured(self) -> bool:
+        return bool(self.config.hikvision_host and self.config.hikvision_user and self.config.hikvision_password)
+
+    def start(self) -> None:
+        if self.thread is not None or not self.config.use_camera_motion_api or not self.configured():
+            return
+        self.session = requests.Session()
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._run, name="hikvision-motion-events", daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=3.0)
+            self.thread = None
+        self.session.close()
+
+    def snapshot(self) -> Tuple[bool, float, str]:
+        with self.lock:
+            return self.active, self.last_event_at, self.last_summary
+
+    def _base_url(self) -> str:
+        host = self.config.hikvision_host
+        if self.config.hikvision_port and ":" not in host:
+            host = f"{host}:{self.config.hikvision_port}"
+        return f"{self.config.hikvision_scheme}://{host}"
+
+    def _request_stream(self) -> requests.Response:
+        url = f"{self._base_url()}{HIKVISION_ALERT_STREAM_PATH}"
+        response = self.session.get(
+            url,
+            auth=requests.auth.HTTPDigestAuth(self.config.hikvision_user, self.config.hikvision_password),
+            stream=True,
+            timeout=(10, self.config.hikvision_event_timeout_seconds),
+            headers={"Accept": "multipart/x-mixed-replace, application/xml"},
+        )
+        if response.status_code == 401:
+            response.close()
+            response = self.session.get(
+                url,
+                auth=requests.auth.HTTPBasicAuth(self.config.hikvision_user, self.config.hikvision_password),
+                stream=True,
+                timeout=(10, self.config.hikvision_event_timeout_seconds),
+                headers={"Accept": "multipart/x-mixed-replace, application/xml"},
+            )
+        response.raise_for_status()
+        return response
+
+    def _request(self, method: str, path: str, **kwargs) -> requests.Response:
+        url = f"{self._base_url()}{path}"
+        session = requests.Session()
+        response = session.request(
+            method,
+            url,
+            auth=requests.auth.HTTPDigestAuth(self.config.hikvision_user, self.config.hikvision_password),
+            **kwargs,
+        )
+        if response.status_code == 401:
+            response.close()
+            response = session.request(
+                method,
+                url,
+                auth=requests.auth.HTTPBasicAuth(self.config.hikvision_user, self.config.hikvision_password),
+                **kwargs,
+            )
+        response.raise_for_status()
+        return response
+
+    def apply_motion_settings(self, zones: List[Any], sensitivity: int) -> None:
+        if not self.configured():
+            raise RuntimeError("Hikvision API is not configured")
+        enabled_zones = [zone for zone in zones if getattr(zone, "enabled", False)]
+        if not enabled_zones:
+            raise RuntimeError("At least one motion zone must be enabled before applying Hikvision motion settings")
+        path = f"/ISAPI/System/Video/inputs/channels/{self.config.hikvision_channel}/motionDetection"
+        response = self._request("GET", path, timeout=10)
+        root = ET.fromstring(response.content)
+        if not (self._configure_grid_motion(root, enabled_zones, sensitivity) or self._configure_region_motion(root, enabled_zones, sensitivity)):
+            raise RuntimeError("Unsupported Hikvision motion XML: no grid or region layout found")
+        payload = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        self._request(
+            "PUT",
+            path,
+            data=payload,
+            timeout=10,
+            headers={"Content-Type": "application/xml"},
+        )
+
+    def _configure_grid_motion(self, root: ET.Element, zones: List[Any], sensitivity: int) -> bool:
+        grid = _xml_first_element(root, "Grid")
+        layout = _xml_first_element(root, "MotionDetectionLayout")
+        if grid is None and layout is None:
+            return False
+        if grid is None:
+            grid = ET.SubElement(root, _xml_tag_like(root, "Grid"))
+        rows = int(_xml_child_text(grid, "rowGranularity") or os.getenv("HIKVISION_GRID_ROWS", "18"))
+        columns = int(_xml_child_text(grid, "columnGranularity") or os.getenv("HIKVISION_GRID_COLUMNS", "22"))
+        _xml_ensure_child(grid, "rowGranularity").text = str(rows)
+        _xml_ensure_child(grid, "columnGranularity").text = str(columns)
+        if layout is None:
+            layout = ET.SubElement(root, _xml_tag_like(root, "MotionDetectionLayout"))
+        _xml_ensure_child(layout, "sensitivityLevel").text = str(sensitivity)
+        layout_container = _xml_child_element(layout, "layout") or layout
+        if layout_container is layout and _xml_child_element(layout, "layout") is None:
+            layout_container = ET.SubElement(layout, _xml_tag_like(layout, "layout"))
+        _xml_ensure_child(layout_container, "gridMap").text = self._zone_grid_map(zones, rows, columns)
+        _xml_ensure_child(root, "enabled").text = "true"
+        _xml_ensure_child(root, "regionType").text = "grid"
+        return True
+
+    def _configure_region_motion(self, root: ET.Element, zones: List[Any], sensitivity: int) -> bool:
+        region_list = _xml_first_element(root, "MotionDetectionRegionList")
+        if region_list is None:
+            return False
+        for child in list(region_list):
+            region_list.remove(child)
+        for index, zone in enumerate(zones, start=1):
+            x1, y1, x2, y2 = zone.roi
+            region = ET.SubElement(region_list, _xml_tag_like(region_list, "MotionDetectionRegion"))
+            ET.SubElement(region, _xml_tag_like(region, "id")).text = str(index)
+            ET.SubElement(region, _xml_tag_like(region, "enabled")).text = "true"
+            ET.SubElement(region, _xml_tag_like(region, "sensitivityLevel")).text = str(sensitivity)
+            coords = ET.SubElement(region, _xml_tag_like(region, "RegionCoordinatesList"))
+            for x, y in ((x1, y1), (x2, y1), (x2, y2), (x1, y2)):
+                coord = ET.SubElement(coords, _xml_tag_like(coords, "RegionCoordinates"))
+                ET.SubElement(coord, _xml_tag_like(coord, "positionX")).text = str(int(round(x * 1000)))
+                ET.SubElement(coord, _xml_tag_like(coord, "positionY")).text = str(int(round(y * 1000)))
+        _xml_ensure_child(root, "enabled").text = "true"
+        return True
+
+    def _zone_grid_map(self, zones: List[Any], rows: int, columns: int) -> str:
+        encoded_rows: List[str] = []
+        for row in range(rows):
+            cell_y1 = row / rows
+            cell_y2 = (row + 1) / rows
+            bits: List[str] = []
+            for column in range(columns):
+                cell_x1 = column / columns
+                cell_x2 = (column + 1) / columns
+                enabled = any(
+                    cell_x2 > zone.roi[0] and cell_x1 < zone.roi[2] and cell_y2 > zone.roi[1] and cell_y1 < zone.roi[3]
+                    for zone in zones
+                )
+                bits.append("1" if enabled else "0")
+            while len(bits) % 4:
+                bits.append("0")
+            encoded_rows.append(f"{int(''.join(bits), 2):0{len(bits) // 4}x}")
+        return "".join(encoded_rows)
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            response: Optional[requests.Response] = None
+            try:
+                with self.lock:
+                    self.last_summary = f"Hikvision motion API: connecting to {self._base_url()}"
+                response = self._request_stream()
+                with self.lock:
+                    self.last_summary = "Hikvision motion API: connected; waiting for VMD events"
+                for payload in _hikvision_xml_payloads(response.iter_content(chunk_size=4096)):
+                    if self.stop_event.is_set():
+                        return
+                    self._handle_payload(payload)
+            except Exception as exc:
+                with self.lock:
+                    self.error_count += 1
+                    self.active = False
+                    self.last_summary = f"Hikvision motion API error: {exc}"
+                logging.warning("Hikvision motion event stream failed: %s", exc)
+                self.stop_event.wait(5.0)
+            finally:
+                if response is not None:
+                    response.close()
+
+    def _handle_payload(self, payload: bytes) -> None:
+        try:
+            root = ET.fromstring(payload)
+        except ET.ParseError:
+            return
+        event_type = (_xml_child_text(root, "eventType") or "").lower()
+        event_state = (_xml_child_text(root, "eventState") or "").lower()
+        channel = _xml_child_text(root, "channelID") or _xml_child_text(root, "dynChannelID")
+        if channel and channel.isdigit() and int(channel) != self.config.hikvision_channel:
+            return
+        if "vmd" not in event_type and "motion" not in event_type:
+            return
+        active = event_state in {"active", "start", "true"} or not event_state
+        now = time.time()
+        summary = f"Hikvision motion API: type={event_type or 'motion'} state={event_state or 'active'} channel={channel or self.config.hikvision_channel}"
+        with self.lock:
+            self.active = active
+            self.last_event_at = now
+            self.last_summary = summary
 
 
 class SingleFfmpegRtspCapture:
