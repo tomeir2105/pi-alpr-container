@@ -23,7 +23,7 @@ Persistent data is stored under:
 2. It watches a configurable road region of interest (ROI).
 3. When motion in that ROI looks vehicle-sized for several consecutive checks, it starts an event.
 4. It keeps a short pre-roll and post-roll buffer so the saved clip includes the full pass.
-5. It records the event video locally on the Pi from that same stream.
+5. It records event video from rolling stream-copy segments without software re-encoding on the Pi.
 6. If the triggered zone has `Fast-ALPR` enabled, it extracts event images and runs `fast-alpr` first.
 7. It uploads qualifying frames to the OpenALPR cloud API.
 8. It stores the clip, extracted frames, API responses, and a summary on disk.
@@ -111,9 +111,9 @@ When the watcher is running, open:
 ## Tuning
 
 - `ROI` should cover only the driveway or road where cars pass.
-- The watcher pulls one camera stream, keeps original frames for the recording prebuffer, and uses resized copies only for motion detection and dashboard live view.
+- The watcher pulls one camera stream. With `SINGLE_FFMPEG_CAPTURE=true`, ffmpeg continuously writes short copied MP4 segments under `/data/events/videos/recording-tmp/stream-segments` and emits reduced JPEG frames for motion detection/dashboard from the same connection.
 - `PLATE_ROI` can be a tighter sub-zone where plates are expected to appear; this crops frames before ALPR runs.
-- `FRAME_WIDTH=960` keeps processing and dashboard streaming bounded. It does not downscale saved motion clips.
+- `FRAME_WIDTH=960` keeps processing and dashboard streaming bounded. It does not downscale saved stream-copy motion clips.
 - `MIN_MOTION_AREA` filters out tiny motion like rain, trees, and shadows.
 - `MIN_CONSECUTIVE_HITS` helps avoid one-frame false triggers.
 - `PREBUFFER_SECONDS` keeps original-resolution video frames from before the trigger.
@@ -136,6 +136,9 @@ When the watcher is running, open:
 - `MAX_SAVED_IMAGES` limits how many JPG captures are kept across all events; the default keeps the newest 2000 images.
 - `STREAM_FPS` controls the dashboard MJPEG refresh rate without slowing the RTSP reader.
 - `CAPTURE_BUFFER_SIZE` and `RTSP_CAPTURE_OPTIONS` favor stable TCP capture over lowest-latency capture to avoid H.264 smear from damaged reference frames.
+- `SINGLE_FFMPEG_CAPTURE=true` uses one ffmpeg process for both reduced analytics frames and direct stream-copy recording segments. This avoids re-encoding 4K event clips on the Raspberry Pi and avoids opening a second camera stream during events.
+- `FFMPEG_ANALYZE_DURATION` and `FFMPEG_PROBE_SIZE` reduce ffmpeg startup probing overhead.
+- `RECORD_SEGMENT_SECONDS` controls the rolling stream-copy segment size. `RECORD_SEGMENT_RETENTION_SECONDS` must be larger than your longest event plus prebuffer.
 - `HOST_DATA_DIR` controls the host folder mounted into both containers as `/data`; keep it on `/mnt/localdisk` to avoid saving outputs on the OS disk.
 - `APP_ENV_FILE` controls the `.env` file mounted into the watcher; keep it under `/mnt/localdisk` so config saves from the UI stay off the OS disk.
 - `DOCKER_LOG_DRIVER=none` prevents Docker from persisting container stdout/stderr logs under Docker's data directory.
@@ -190,6 +193,11 @@ FFMPEG_THREADS=1
 STREAM_FPS=3
 CAPTURE_BUFFER_SIZE=4
 RTSP_CAPTURE_OPTIONS=rtsp_transport;tcp|max_delay;2000000|stimeout;10000000
+SINGLE_FFMPEG_CAPTURE=true
+FFMPEG_ANALYZE_DURATION=500000
+FFMPEG_PROBE_SIZE=32768
+RECORD_SEGMENT_SECONDS=2
+RECORD_SEGMENT_RETENTION_SECONDS=300
 HOST_DATA_DIR=/mnt/localdisk/pi-alpr
 APP_ENV_FILE=/mnt/localdisk/pi-alpr/config/.env
 DOCKER_LOG_DRIVER=none
@@ -206,6 +214,7 @@ Notes:
 - With the default `POSTBUFFER_SECONDS=5.0`, the image event keeps collecting frames for 5 seconds after motion stops.
 - The images page keeps only the newest `MAX_SAVED_IMAGES` JPG files, removes older frame artifacts automatically, and pages results so large image sets are not rendered all at once.
 - Event/test frame policy: crop to `PLATE_ROI` if set, run `fast-alpr`, and only send to OpenALPR if `fast-alpr` found a plate at or above `FAST_ALPR_MIN_CONFIDENCE`.
+- Temporary recordings and rolling segments are stored under `VIDEO_OUTPUT_DIR/recording-tmp`. With the default compose mount, that is `/mnt/localdisk/pi-alpr/events/videos/recording-tmp` on the Pi, not the SD card.
 - Manual video extraction writes image sets under `events/images/<camera_name>_video_extract_<timestamp>/`.
 
 ## Output

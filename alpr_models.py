@@ -13,8 +13,15 @@ VIDEO_PREBUFFER_SECONDS = 10.0
 VIDEO_RECORDING_SECONDS = 180.0
 DEFAULT_FRAME_WIDTH = 960
 MAX_VIDEO_PREBUFFER_FRAMES = 150
+DEFAULT_VIDEO_FRAME_WIDTH = 1920
+DEFAULT_VIDEO_FPS = 8.0
+DEFAULT_VIDEO_PREBUFFER_MAX_FRAMES = 8
 VIDEO_WRITER_QUEUE_SECONDS = 3.0
 DEFAULT_RTSP_CAPTURE_OPTIONS = "rtsp_transport;tcp|max_delay;2000000|stimeout;10000000"
+DEFAULT_FFMPEG_ANALYZE_DURATION = "500000"
+DEFAULT_FFMPEG_PROBE_SIZE = "32768"
+DEFAULT_RECORD_SEGMENT_SECONDS = 2.0
+DEFAULT_RECORD_SEGMENT_RETENTION_SECONDS = 300.0
 DEFAULT_ALPR_CAPTURE_FPS = 1.0
 GALLERY_PAGE_SIZE = 24
 MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024
@@ -81,6 +88,14 @@ class Config:
     stream_fps: float
     capture_buffer_size: int
     rtsp_capture_options: str
+    video_frame_width: int
+    video_fps: float
+    video_prebuffer_max_frames: int
+    single_ffmpeg_capture: bool
+    ffmpeg_analyze_duration: str
+    ffmpeg_probe_size: str
+    record_segment_seconds: float
+    record_segment_retention_seconds: float
     alpr_capture_fps: float
     alpr_capture_warmup_seconds: float
     live_stream_warmup_seconds: float
@@ -159,6 +174,19 @@ class Config:
             capture_buffer_size=max(1, int(getenv("CAPTURE_BUFFER_SIZE", "4"))),
             rtsp_capture_options=getenv("RTSP_CAPTURE_OPTIONS", DEFAULT_RTSP_CAPTURE_OPTIONS).strip()
             or DEFAULT_RTSP_CAPTURE_OPTIONS,
+            video_frame_width=max(0, int(getenv("VIDEO_FRAME_WIDTH", str(DEFAULT_VIDEO_FRAME_WIDTH)))),
+            video_fps=max(0.0, float(getenv("VIDEO_FPS", str(DEFAULT_VIDEO_FPS)))),
+            video_prebuffer_max_frames=max(1, int(getenv("VIDEO_PREBUFFER_MAX_FRAMES", str(DEFAULT_VIDEO_PREBUFFER_MAX_FRAMES)))),
+            single_ffmpeg_capture=parse_bool(getenv("SINGLE_FFMPEG_CAPTURE", "true"), default=True),
+            ffmpeg_analyze_duration=getenv("FFMPEG_ANALYZE_DURATION", DEFAULT_FFMPEG_ANALYZE_DURATION).strip()
+            or DEFAULT_FFMPEG_ANALYZE_DURATION,
+            ffmpeg_probe_size=getenv("FFMPEG_PROBE_SIZE", DEFAULT_FFMPEG_PROBE_SIZE).strip()
+            or DEFAULT_FFMPEG_PROBE_SIZE,
+            record_segment_seconds=max(1.0, float(getenv("RECORD_SEGMENT_SECONDS", str(DEFAULT_RECORD_SEGMENT_SECONDS)))),
+            record_segment_retention_seconds=max(
+                30.0,
+                float(getenv("RECORD_SEGMENT_RETENTION_SECONDS", str(DEFAULT_RECORD_SEGMENT_RETENTION_SECONDS))),
+            ),
             alpr_capture_fps=max(0.1, float(getenv("ALPR_CAPTURE_FPS", str(DEFAULT_ALPR_CAPTURE_FPS)))),
             alpr_capture_warmup_seconds=max(0.0, float(getenv("ALPR_CAPTURE_WARMUP_SECONDS", "1.5"))),
             live_stream_warmup_seconds=max(0.0, float(getenv("LIVE_STREAM_WARMUP_SECONDS", "1.5"))),
@@ -256,6 +284,7 @@ class VideoRecording:
     source_url: str = ""
     confirmed: bool = False
     pending_events: List[Event] = field(default_factory=list)
+    segment_paths: List[Path] = field(default_factory=list)
     MAX_PENDING_EVENTS: int = field(default=20, repr=False)
 
     def append_pending_event(self, event: "Event") -> None:

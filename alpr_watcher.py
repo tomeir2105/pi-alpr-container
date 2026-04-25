@@ -44,7 +44,7 @@ from alpr_models import (
     parse_normalized_roi,
     redact_url_credentials,
 )
-from alpr_services import FfmpegVideoWriter, OpenAlprClient, QueuedVideoWriter
+from alpr_services import FfmpegVideoWriter, OpenAlprClient, QueuedVideoWriter, SingleFfmpegRtspCapture
 
 
 class RtspVehicleWatcher:
@@ -76,6 +76,7 @@ class RtspVehicleWatcher:
         self.frame_index = 0
         self.fps_guess = 12.0
         self.capture = None
+        self.single_capture: Optional[SingleFfmpegRtspCapture] = None
         self.background = cv2.createBackgroundSubtractorMOG2(history=400, varThreshold=36, detectShadows=False)
         self.config.event_output_dir.mkdir(parents=True, exist_ok=True)
         self.config.image_output_dir.mkdir(parents=True, exist_ok=True)
@@ -454,18 +455,30 @@ class RtspVehicleWatcher:
             "OPENCV_FFMPEG_CAPTURE_OPTIONS",
             self.config.rtsp_capture_options,
         )
-        self.capture = cv2.VideoCapture(self.config.rtsp_url, cv2.CAP_FFMPEG)
-        if not self.capture.isOpened():
-            raise RuntimeError("Unable to open RTSP stream")
-        self.capture.set(cv2.CAP_PROP_BUFFERSIZE, self.config.capture_buffer_size)
+        use_single_ffmpeg_capture = self.config.single_ffmpeg_capture and shutil.which("ffmpeg")
+        if use_single_ffmpeg_capture:
+            transport = self._rtsp_option_value("rtsp_transport", "tcp") or "tcp"
+            self.single_capture = SingleFfmpegRtspCapture(
+                self.config,
+                self._recording_segment_dir(),
+                transport,
+            )
+            self.single_capture.start()
+            self.fps_guess = max(1.0, self.config.stream_fps)
+        else:
+            self.capture = cv2.VideoCapture(self.config.rtsp_url, cv2.CAP_FFMPEG)
+            if not self.capture.isOpened():
+                raise RuntimeError("Unable to open RTSP stream")
+            self.capture.set(cv2.CAP_PROP_BUFFERSIZE, self.config.capture_buffer_size)
 
-        native_fps = self.capture.get(cv2.CAP_PROP_FPS)
-        if native_fps and native_fps > 1:
-            self.fps_guess = native_fps
+            native_fps = self.capture.get(cv2.CAP_PROP_FPS)
+            if native_fps and native_fps > 1:
+                self.fps_guess = native_fps
         logging.info(
-            "Connected. Camera FPS estimate: %.2f; processing width: %s",
+            "Connected. Camera FPS estimate: %.2f; processing width: %s; capture mode: %s",
             self.fps_guess,
             "native" if self.config.frame_width <= 0 else self.config.frame_width,
+            "single-ffmpeg-stream-copy" if use_single_ffmpeg_capture else "opencv",
         )
 
         capture_stop = threading.Event()
@@ -501,11 +514,14 @@ class RtspVehicleWatcher:
         def capture_reader() -> None:
             try:
                 while not capture_stop.is_set():
-                    ok, captured_frame = self.capture.read()
-                    if not ok or captured_frame is None:
-                        with self.stats_lock:
-                            self.read_failure_total += 1
-                        raise RuntimeError("Failed to read frame from RTSP stream")
+                    if self.single_capture is not None:
+                        captured_frame = self.single_capture.read_frame(timeout_seconds=5.0)
+                    else:
+                        ok, captured_frame = self.capture.read()
+                        if not ok or captured_frame is None:
+                            with self.stats_lock:
+                                self.read_failure_total += 1
+                            raise RuntimeError("Failed to read frame from RTSP stream")
                     timestamp = time.time()
                     self._record_capture_frame(timestamp)
                     replace_captured_frame((timestamp, captured_frame))
@@ -648,7 +664,12 @@ class RtspVehicleWatcher:
             capture_stop.set()
             capture_thread.join(timeout=2.0)
             self._stop_video_recording()
-            self.capture.release()
+            if self.single_capture is not None:
+                self.single_capture.stop()
+                self.single_capture = None
+            if self.capture is not None:
+                self.capture.release()
+                self.capture = None
 
     def _resize_frame(self, frame):
         if self.config.frame_width <= 0:
@@ -746,6 +767,11 @@ class RtspVehicleWatcher:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def _recording_segment_dir(self) -> Path:
+        path = self._video_temp_dir() / "stream-segments"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
     def _relative_image_path(self, path: Path) -> str:
         return path.relative_to(self.config.image_output_dir).as_posix()
 
@@ -775,12 +801,26 @@ class RtspVehicleWatcher:
                 temp_path.unlink(missing_ok=True)
             except Exception:
                 logging.exception("Failed to remove stale temporary video %s", temp_path)
+        segment_dir = self._recording_segment_dir()
+        for segment_path in segment_dir.glob("seg-*.mp4"):
+            try:
+                segment_path.unlink(missing_ok=True)
+            except Exception:
+                logging.exception("Failed to remove stale recording segment %s", segment_path)
 
     def _prepare_video_frame(self, frame, frame_size: Tuple[int, int]):
         width, height = frame_size
         if frame.shape[1] != width or frame.shape[0] != height:
             frame = cv2.resize(frame, (width, height))
         return np.ascontiguousarray(frame)
+
+    def _recording_frame_size(self, frame) -> Tuple[int, int]:
+        height, width = frame.shape[:2]
+        target_width = self.config.video_frame_width
+        if target_width <= 0 or width <= target_width:
+            return (width, height)
+        scale = target_width / float(width)
+        return (target_width, max(1, int(round(height * scale))))
 
     def _reset_coverage_accumulators(self) -> None:
         self.cumulative_zone_masks_by_id = {}
@@ -804,6 +844,38 @@ class RtspVehicleWatcher:
         stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         output_path = video_dir / f"{self.config.camera_name}_{stamp}.mp4"
         temp_output_path = self._video_temp_dir() / output_path.name
+        if self.single_capture is not None:
+            first_frame_at = max(0.0, timestamp - self._video_prebuffer_seconds())
+            self.video_recording = VideoRecording(
+                started_at=timestamp,
+                first_frame_at=first_frame_at,
+                ends_at=timestamp + record_seconds,
+                record_seconds=record_seconds,
+                started_from_zone_ids=set(triggered_zone_ids),
+                output_path=output_path,
+                temp_output_path=temp_output_path,
+                writer=None,
+                last_written_at=timestamp,
+                frame_size=(0, 0),
+                fps=max(1.0, self.fps_guess),
+                source_url=self.config.rtsp_url,
+                confirmed=confirmed,
+            )
+            status = "confirmed motion" if confirmed else "motion warning"
+            logging.info(
+                "Started %.0f-second stream-copy video recording at %s on %s for zones=%s using rolling segments in %s",
+                record_seconds,
+                output_path,
+                status,
+                ",".join(sorted(triggered_zone_ids)) or "unknown",
+                self._recording_segment_dir(),
+            )
+            self._add_event_log(
+                "video",
+                f"Started stream-copy video {output_path.name} for {int(round(record_seconds))}s on {status} using rolling segments for zones={','.join(sorted(triggered_zone_ids)) or 'unknown'}",
+                zone_id=vid_zone_id,
+            )
+            return
         prebuffer_frames = [
             (frame_timestamp, frame_copy)
             for frame_timestamp, frame_copy in self.prebuffer
@@ -821,11 +893,11 @@ class RtspVehicleWatcher:
             sample_frame = self.prebuffer[-1][1]
         else:
             return
-        height, width = sample_frame.shape[:2]
-        frame_size = (width, height)
+        frame_size = self._recording_frame_size(sample_frame)
         with self.stats_lock:
             processing_fps = self._rolling_fps(deque(self.processing_frame_times))
-        fps = max(5.0, min(60.0, self.fps_guess or processing_fps or 20.0))
+        fps_source = self.config.video_fps if self.config.video_fps > 0 else (self.fps_guess or processing_fps or 20.0)
+        fps = max(1.0, min(60.0, fps_source))
         if shutil.which("ffmpeg"):
             raw_writer = FfmpegVideoWriter(temp_output_path, fps, frame_size, self.config.ffmpeg_threads)
         else:
@@ -894,6 +966,9 @@ class RtspVehicleWatcher:
         if timestamp > recording.ends_at:
             self._stop_video_recording()
             return
+        if recording.writer is None:
+            recording.last_written_at = timestamp
+            return
         min_frame_interval = 1.0 / recording.fps
         if timestamp <= recording.last_written_at:
             return
@@ -914,7 +989,8 @@ class RtspVehicleWatcher:
             return
         release_error: Optional[Exception] = None
         try:
-            recording.writer.release()
+            if recording.writer is not None:
+                recording.writer.release()
         except Exception as exc:
             release_error = exc
         finally:
@@ -922,6 +998,15 @@ class RtspVehicleWatcher:
             self.last_video_recording = recording
             self.last_recording_ended_at = time.time()
         rec_zone_id = self._primary_zone_id_for(recording.started_from_zone_ids)
+        if recording.writer is None and recording.confirmed and self.single_capture is not None:
+            try:
+                recording.segment_paths = self.single_capture.copy_clip(
+                    recording.first_frame_at,
+                    recording.ends_at,
+                    recording.temp_output_path,
+                )
+            except Exception as exc:
+                release_error = exc
         if release_error:
             if not self._video_file_is_readable(recording.temp_output_path):
                 recording.temp_output_path.unlink(missing_ok=True)
@@ -1271,7 +1356,7 @@ class RtspVehicleWatcher:
                     "camera_name": self.config.camera_name,
                     "video_path": str(recording.output_path),
                     "source": "capture-stream",
-                    "recording_mode": "main_capture_original_frames",
+                    "recording_mode": "stream_copy_segments" if recording.writer is None else "main_capture_original_frames",
                     "started_at_epoch": recording.started_at,
                     "first_frame_at_epoch": recording.first_frame_at,
                     "ends_at_epoch": recording.ends_at,
@@ -1279,6 +1364,8 @@ class RtspVehicleWatcher:
                     "event_count": len(recording.pending_events),
                     "prebuffer_seconds": self._video_prebuffer_seconds(),
                     "recording_seconds": recording.record_seconds,
+                    "segment_count": len(recording.segment_paths),
+                    "segment_paths": [str(path) for path in recording.segment_paths],
                 },
                 indent=2,
             )
@@ -1286,8 +1373,11 @@ class RtspVehicleWatcher:
 
     def _prebuffer_frame_limit(self) -> int:
         if self.config.prebuffer_frames > 0:
-            return self.config.prebuffer_frames
-        return int(self.fps_guess * max(0.1, self._video_prebuffer_seconds()))
+            return min(self.config.prebuffer_frames, self.config.video_prebuffer_max_frames)
+        return min(
+            int(self.fps_guess * max(0.1, self._video_prebuffer_seconds())),
+            self.config.video_prebuffer_max_frames,
+        )
 
     def _postbuffer_frame_limit(self) -> int:
         if self.config.postbuffer_frames > 0:
@@ -4898,7 +4988,19 @@ a {{ color: #93c5fd; }}
         restart_needed = [
             name
             for name in changed
-            if name in {"web_host", "web_port", "rtsp_url", "rtsp_capture_options", "capture_buffer_size"}
+            if name
+            in {
+                "web_host",
+                "web_port",
+                "rtsp_url",
+                "rtsp_capture_options",
+                "capture_buffer_size",
+                "single_ffmpeg_capture",
+                "ffmpeg_analyze_duration",
+                "ffmpeg_probe_size",
+                "record_segment_seconds",
+                "record_segment_retention_seconds",
+            }
         ]
         self.config = new_config
         self.client = OpenAlprClient(self.config)
