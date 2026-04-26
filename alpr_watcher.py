@@ -3254,19 +3254,13 @@ class RtspVehicleWatcher:
     yellow: document.getElementById('zone-enabled-yellow'),
     purple: document.getElementById('zone-enabled-purple'),
   }};
-  const zoneFastAlpr = {{
-    yellow: document.getElementById('zone-fast-alpr-yellow'),
-    purple: document.getElementById('zone-fast-alpr-purple'),
-  }};
-  const zoneTelegram = {{
-    yellow: document.getElementById('zone-telegram-yellow'),
-    purple: document.getElementById('zone-telegram-purple'),
-  }};
   const sharedRecordSeconds = document.getElementById('shared-record-seconds');
   const sharedImageCount = document.getElementById('shared-image-count');
   const sharedCoverageTrigger = document.getElementById('shared-coverage-trigger');
   const sharedExtractImages = document.getElementById('shared-extract-images');
-  if (!editor || !overlay || !img || !saveBtn || !resetBtn || !status || !sensitivity || !sensitivityValue || !sensitivitySave || handles.length !== 4 || !zoneBoxes.yellow || !zoneBoxes.purple || !zoneButtons.yellow || !zoneButtons.purple || !zoneEnabled.yellow || !zoneEnabled.purple || !zoneFastAlpr.yellow || !zoneFastAlpr.purple || !zoneTelegram.yellow || !zoneTelegram.purple || !sharedRecordSeconds || !sharedImageCount || !sharedCoverageTrigger || !sharedExtractImages) return;
+  const sharedFastAlpr = document.getElementById('shared-fast-alpr');
+  const sharedTelegram = document.getElementById('shared-telegram');
+  if (!editor || !overlay || !img || !saveBtn || !resetBtn || !status || !sensitivity || !sensitivityValue || !sensitivitySave || handles.length !== 4 || !zoneBoxes.yellow || !zoneBoxes.purple || !zoneButtons.yellow || !zoneButtons.purple || !zoneEnabled.yellow || !zoneEnabled.purple || !sharedRecordSeconds || !sharedImageCount || !sharedCoverageTrigger || !sharedExtractImages || !sharedFastAlpr || !sharedTelegram) return;
 
   let zones = initialZones.map((zone) => ({{ ...zone, roi: zone.roi.slice() }}));
   let activeZoneId = null;
@@ -3391,12 +3385,22 @@ class RtspVehicleWatcher:
     return zones.some((zone) => zone.extract_images !== false);
   }}
 
-  function setSharedRecordingPolicy(recordSeconds, imageCount, coverageTriggerPercent, extractImages = sharedExtractImagesValue()) {{
+  function sharedFastAlprValue() {{
+    return zones.some((zone) => zone.use_fast_alpr !== false);
+  }}
+
+  function sharedTelegramValue() {{
+    return zones.some((zone) => zone.send_telegram !== false);
+  }}
+
+  function setSharedRecordingPolicy(recordSeconds, imageCount, coverageTriggerPercent, extractImages = sharedExtractImagesValue(), useFastAlpr = sharedFastAlprValue(), sendTelegram = sharedTelegramValue()) {{
     zones.forEach((zone) => {{
       zone.record_seconds = recordSeconds;
       zone.image_count = imageCount;
       zone.coverage_trigger_percent = coverageTriggerPercent;
       zone.extract_images = Boolean(extractImages);
+      zone.use_fast_alpr = Boolean(useFastAlpr);
+      zone.send_telegram = Boolean(sendTelegram);
     }});
   }}
 
@@ -3430,14 +3434,17 @@ class RtspVehicleWatcher:
     sharedImageCount.value = String(sharedImageCountRounded);
     sharedCoverageTrigger.value = String(sharedCoverageTriggerRounded);
     const extractImages = sharedExtractImagesValue();
-    setSharedRecordingPolicy(sharedRecordSecondsRounded, sharedImageCountRounded, sharedCoverageTriggerRounded, extractImages);
+    const useFastAlpr = sharedFastAlprValue();
+    const sendTelegram = sharedTelegramValue();
+    setSharedRecordingPolicy(sharedRecordSecondsRounded, sharedImageCountRounded, sharedCoverageTriggerRounded, extractImages, useFastAlpr, sendTelegram);
     setToggle(sharedExtractImages, extractImages);
+    setToggle(sharedFastAlpr, useFastAlpr);
+    setToggle(sharedTelegram, sendTelegram);
     zones.forEach((zone) => {{
       zoneEnabled[zone.id].checked = Boolean(zone.enabled);
-      setToggle(zoneFastAlpr[zone.id], Boolean(zone.use_fast_alpr));
-      setToggle(zoneTelegram[zone.id], Boolean(zone.send_telegram));
       zoneButtons[zone.id].style.outline = zone.id === activeZoneId ? `2px solid ${{zone.color}}` : 'none';
-      zoneButtons[zone.id].textContent = zone.id === activeZoneId ? `Editing ${{zone.label}}` : `Edit ${{zone.label}}`;
+      zoneButtons[zone.id].style.boxShadow = zone.id === activeZoneId ? `0 0 0 4px rgba(248,250,252,0.18)` : 'none';
+      zoneButtons[zone.id].setAttribute('aria-pressed', zone.id === activeZoneId ? 'true' : 'false');
     }});
   }}
 
@@ -3610,43 +3617,33 @@ class RtspVehicleWatcher:
     }});
   }});
 
-  Object.entries(zoneFastAlpr).forEach(([zoneId, btn]) => {{
-    btn.addEventListener('click', () => {{
-      const zone = findZone(zoneId);
-      if (!zone) return;
-      zone.use_fast_alpr = !zone.use_fast_alpr;
-      setToggle(btn, zone.use_fast_alpr);
-      draw();
-    }});
-  }});
-
-  Object.entries(zoneTelegram).forEach(([zoneId, btn]) => {{
-    btn.addEventListener('click', () => {{
-      const zone = findZone(zoneId);
-      if (!zone) return;
-      zone.send_telegram = !zone.send_telegram;
-      setToggle(btn, zone.send_telegram);
-      draw();
-    }});
-  }});
-
   sharedRecordSeconds.addEventListener('change', () => {{
-    setSharedRecordingPolicy(Number(sharedRecordSeconds.value) || sharedRecordSecondsValue(), sharedImageCountValue(), sharedCoverageTriggerValue(), sharedExtractImagesValue());
+    setSharedRecordingPolicy(Number(sharedRecordSeconds.value) || sharedRecordSecondsValue(), sharedImageCountValue(), sharedCoverageTriggerValue(), sharedExtractImagesValue(), sharedFastAlprValue(), sharedTelegramValue());
     draw();
   }});
 
   sharedImageCount.addEventListener('change', () => {{
-    setSharedRecordingPolicy(sharedRecordSecondsValue(), Number(sharedImageCount.value) || sharedImageCountValue(), sharedCoverageTriggerValue(), sharedExtractImagesValue());
+    setSharedRecordingPolicy(sharedRecordSecondsValue(), Number(sharedImageCount.value) || sharedImageCountValue(), sharedCoverageTriggerValue(), sharedExtractImagesValue(), sharedFastAlprValue(), sharedTelegramValue());
     draw();
   }});
 
   sharedCoverageTrigger.addEventListener('change', () => {{
-    setSharedRecordingPolicy(sharedRecordSecondsValue(), sharedImageCountValue(), Number(sharedCoverageTrigger.value) || 0, sharedExtractImagesValue());
+    setSharedRecordingPolicy(sharedRecordSecondsValue(), sharedImageCountValue(), Number(sharedCoverageTrigger.value) || 0, sharedExtractImagesValue(), sharedFastAlprValue(), sharedTelegramValue());
     draw();
   }});
 
   sharedExtractImages.addEventListener('click', () => {{
-    setSharedRecordingPolicy(sharedRecordSecondsValue(), sharedImageCountValue(), sharedCoverageTriggerValue(), !sharedExtractImagesValue());
+    setSharedRecordingPolicy(sharedRecordSecondsValue(), sharedImageCountValue(), sharedCoverageTriggerValue(), !sharedExtractImagesValue(), sharedFastAlprValue(), sharedTelegramValue());
+    draw();
+  }});
+
+  sharedFastAlpr.addEventListener('click', () => {{
+    setSharedRecordingPolicy(sharedRecordSecondsValue(), sharedImageCountValue(), sharedCoverageTriggerValue(), sharedExtractImagesValue(), !sharedFastAlprValue(), sharedTelegramValue());
+    draw();
+  }});
+
+  sharedTelegram.addEventListener('click', () => {{
+    setSharedRecordingPolicy(sharedRecordSecondsValue(), sharedImageCountValue(), sharedCoverageTriggerValue(), sharedExtractImagesValue(), sharedFastAlprValue(), !sharedTelegramValue());
     draw();
   }});
 
